@@ -35,15 +35,14 @@ impl Id for u64 {}
 pub struct Scheduler<I> {
     tasks: HashMap<I, Pin<Box<dyn Future<Output = ()> + Send>>>,
     priorities: BTreeMap<Reverse<u8>, VecDeque<I>>,
-    // results: Arc<Mutex<HashMap<I, Box<dyn Any>>>>,
     results: Arc<AtomicPtr<HashMap<I, Box<dyn Any>>>>,
 }
 
 impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
     pub fn new() -> Self {
-        // Allocate a new boxed HashMap and create a raw pointer to it
+        // Allocate a new boxed HashMap and create a raw pointer to it.
         let boxed_map = Box::new(HashMap::<I, Box<dyn Any>>::with_capacity(8));
-        let ptr = Box::into_raw(boxed_map); // Convert to raw pointer
+        let ptr = Box::into_raw(boxed_map); // Convert to raw pointer.
         Scheduler {
             tasks: HashMap::with_capacity(8),
             priorities: BTreeMap::new(),
@@ -56,13 +55,21 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
         id: I,
         task: impl Future<Output = T> + Send + 'static,
     ) {
+        self.add_priority_task(id, 0, task);
+    }
+
+    pub fn add_priority_task<T: Display + 'static>(
+        &mut self,
+        id: I,
+        priority: u8,
+        task: impl Future<Output = T> + Send + 'static,
+    ) {
         let idc = id.clone();
         let results = Arc::clone(&self.results);
         self.tasks.insert(
             id.clone(),
             Box::pin(async move {
                 let r = task.await;
-                // results.lock().unwrap().insert(idc, Box::new(r));
                 let raw = results.load(Ordering::Relaxed);
                 if raw.is_null() {
                     return;
@@ -75,7 +82,7 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
             }),
         );
         self.priorities
-            .entry(Reverse(0))
+            .entry(Reverse(priority))
             .and_modify(|v| v.push_back(id.clone()))
             .or_insert_with(|| {
                 let mut vd = VecDeque::with_capacity(4);
@@ -84,7 +91,8 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
             });
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run_all(&mut self) {
+        // Taking priorities in reverse so highest priorities come first.
         for (_, vd) in self.priorities.iter_mut() {
             while let Some(id) = vd.pop_front() {
                 if let Some(f) = self.tasks.remove(&id) {
@@ -94,41 +102,48 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
         }
     }
 
-
-    // fn invoke_fn_pointer<T: 'static>(&mut self, id: I) {
-    //      self.take_fn_pointer(Self::get_result_ref::<T>, id);
-    // }
-
-    // fn take_fn_pointer<T>(&mut self, fp: for<'a, 'b> fn(&'a Self, &'b I) -> Option<&'a T>, id: I) {
-    //     fp(self, &id);
-    // }
-
-    // pub async fn run_map<T: 'static, R>(&mut self, project: impl Fn(&T) -> R) {
-    //     for (_, vd) in self.priorities.iter() {
-    //         let vd = vd.iter().collect::<Vec<_>>();
-    //         for id in vd {
-    //             if let Some(f) = self.tasks.remove(id) {
-    //                 f.await;
-    //                 if let Some(r) = self.get_result_ref::<T>(id) {
-    //                     project(r);
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     // Remove all stored Id's from (priority, VecDeque<Id>) pairs since every future has run.
-    //     for (_, vd) in self.priorities.iter_mut() {
-    //         vd.clear();
-    //     }
-    // }
-
-    pub async fn run_by_id(&mut self, id: &I) {
+    pub async fn run(&mut self, id: &I) {
         if let Some(f) = self.tasks.remove(id) {
             f.await;
         }
     }
 
+    pub async fn run_priorities(&mut self, priority: u8) {
+        if let Some(vd) = self.priorities.get_mut(&Reverse(priority)) {
+            while let Some(id) = vd.pop_front() {
+                if let Some(f) = self.tasks.remove(&id) {
+                    f.await;
+                }
+            }
+        }
+    }
+
+    pub async fn run_map<T: 'static, R>(&mut self, id: &I, project: impl Fn(&T) -> R) -> Option<R> {
+        let r = if let Some(f) = self.tasks.remove(id) {
+            f.await;
+            self.get_result_ref::<T>(id).map(project)
+        } else {
+            None
+        };
+
+        // Find this `id` in priorities and remove it since that future did run.
+        let mut done = false;
+        for (_, vd) in self.priorities.iter_mut() {
+            vd.retain(|i| {
+                if i == id {
+                    done = true;
+                    return false;
+                }
+                true
+            });
+            if done {
+                break;
+            }
+        }
+        r
+    }
+
     pub fn get_result<T: 'static>(&mut self, id: &I) -> Result<Box<T>, Box<dyn Any>> {
-        // let mut r = self.results.lock().unwrap();
         let raw = self.results.load(Ordering::Relaxed);
         if raw.is_null() {
             return Err(Box::new(()));
@@ -139,16 +154,6 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
             map.remove(id)
         };
         d.unwrap_or_else(|| Box::new("No result")).downcast::<T>()
-        // println!("ID IS {:?} -- {:?}", r, id);
-        // let r = r.get(&id).unwrap();
-        // if r.is::<i32>() {
-        //     println!("It's a string!");
-        // } else {
-        //     println!("Not a string...");
-        // }
-        // println!("ID IS {:?}", r.downcast_ref::<T>());
-        // let r = r.downcast_ref::<T>();
-        // None
     }
 
     pub fn get_result_ref<T: 'static>(&self, id: &I) -> Option<&T> {
@@ -158,7 +163,7 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
         }
         let d = unsafe {
             let map = &*raw;
-            map.get(&id)
+            map.get(id)
         };
         d.map(|v| v.downcast_ref())?
     }
@@ -288,8 +293,7 @@ impl<T: Default + Display> Task<T> {
             .get_or_insert_with(|| Vec::with_capacity(16))
             .push(Box::new(move || {
                 let r = dep();
-                let r = catch_rt(r);
-                r
+                catch_rt(r)
             }));
     }
 
@@ -445,9 +449,6 @@ impl<T: Default + Display> Task<T> {
                 return false;
             } else {
                 let p = THREAD_POOL.get().expect("Thread pool not initialized");
-                // println!("Startline not reached");
-                // std::thread::sleep(Duration::from_millis(5000));
-
                 let waker = cx.waker().clone();
                 let startline = self.startline.unwrap();
 
@@ -466,12 +467,11 @@ impl<T: Default + Display> Task<T> {
         &mut self,
         detached_receiver: Option<PollingStrategy>,
     ) -> DetachedPolling {
-        let dreceiver;
-        match detached_receiver {
-            Some(PollingStrategy::Detached) => dreceiver = &mut self.detached_polling_success,
-            None => dreceiver = &mut self.detached_dependencies_success,
+        let dreceiver = match detached_receiver {
+            Some(PollingStrategy::Detached) => &mut self.detached_polling_success,
+            None => &mut self.detached_dependencies_success,
             _ => unreachable!(),
-        }
+        };
 
         if let Some(receiver) = dreceiver.as_mut() {
             if let Ok(Some(r)) = receiver.try_recv() {
@@ -487,7 +487,6 @@ impl<T: Default + Display> Task<T> {
                 dreceiver.take();
                 return DetachedPolling::Ready;
             } else {
-                // Ok(None) => No message received.
                 return DetachedPolling::Pending;
             }
         }
@@ -528,7 +527,7 @@ impl<T: Display + Default> Future for Task<T> {
                 this.poll_concurrent(cx, &mut ready);
             }
             PollingStrategy::StepByStep => {
-                // Sequentially poll dependencies
+                // Sequentially poll dependencies.
                 ready = this.poll_sequential(cx);
             }
             PollingStrategy::Detached if !this.dependencies.is_empty() => {
