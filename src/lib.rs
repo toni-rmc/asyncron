@@ -1,12 +1,12 @@
 use std::{
     any::Any,
     cmp::Reverse,
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt::{Debug, Display},
     hash::Hash,
     pin::Pin,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicPtr, Ordering},
     },
     time::{Duration, Instant},
@@ -19,8 +19,11 @@ use futures::{
         oneshot::{self, Receiver},
     },
     executor::ThreadPool,
-    future::Future,
 };
+
+pub mod task_ext;
+
+pub mod delay;
 
 pub trait Id: Eq + Hash + Clone {}
 
@@ -32,13 +35,71 @@ impl Id for u32 {}
 impl Id for i64 {}
 impl Id for u64 {}
 
-pub struct Scheduler<I> {
-    tasks: HashMap<I, Pin<Box<dyn Future<Output = ()> + Send>>>,
-    priorities: BTreeMap<Reverse<u8>, VecDeque<I>>,
-    results: Arc<AtomicPtr<HashMap<I, Box<dyn Any>>>>,
+struct TaskWrapper<I> {
+    id: I,
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
 
-impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
+impl<I: Id> TaskWrapper<I> {
+    fn new(
+        id: I,
+        future: impl Future<Output = ()> + Send + 'static,
+        canceled_queue: Arc<Mutex<HashSet<I>>>,
+    ) -> Self {
+        TaskWrapper {
+            id,
+            future: Box::pin(future),
+            canceled_queue,
+        }
+    }
+}
+
+impl<I: Unpin + Eq + Hash> Future for TaskWrapper<I> {
+    type Output = ();
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Check again if user canceled `Task` in the meantime while it's running.
+        let mut queue = self.canceled_queue.lock().unwrap();
+        if queue.contains(&self.id) {
+            queue.remove(&self.id);
+            return std::task::Poll::Ready(());
+        }
+        drop(queue);
+        // let this = self.get_mut();
+        self.future.as_mut().poll(cx)
+    }
+}
+
+pub struct TaskManager<I> {
+    canceled_queue: Arc<Mutex<HashSet<I>>>,
+}
+
+impl<I: Eq + Hash> TaskManager<I> {
+    pub fn cancel(&self, id: I) {
+        self.canceled_queue.lock().unwrap().insert(id);
+    }
+
+    pub fn restore(&self, id: &I) {
+        self.canceled_queue.lock().unwrap().remove(id);
+    }
+}
+
+pub struct TaskHandle<I> {
+    id: I,
+    canceled_queue: Arc<Mutex<HashSet<I>>>,
+}
+
+pub struct Scheduler<I> {
+    tasks: HashMap<I, TaskWrapper<I>>,
+    priorities: BTreeMap<Reverse<u8>, VecDeque<I>>,
+    results: Arc<AtomicPtr<HashMap<I, Box<dyn Any>>>>,
+    canceled_queue: Arc<Mutex<HashSet<I>>>,
+}
+
+impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
     pub fn new() -> Self {
         // Allocate a new boxed HashMap and create a raw pointer to it.
         let boxed_map = Box::new(HashMap::<I, Box<dyn Any>>::with_capacity(8));
@@ -47,6 +108,7 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
             tasks: HashMap::with_capacity(8),
             priorities: BTreeMap::new(),
             results: Arc::new(AtomicPtr::new(ptr)),
+            canceled_queue: Arc::new(Mutex::new(HashSet::with_capacity(8))),
         }
     }
 
@@ -66,20 +128,33 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
     ) {
         let idc = id.clone();
         let results = Arc::clone(&self.results);
+        let canceled_queue = Arc::clone(&self.canceled_queue);
+        let canceled_queue_cl = Arc::clone(&self.canceled_queue);
+        // Prevent unwanted cancellations if user later adds `Task` with the same `id`.
+        canceled_queue.lock().unwrap().remove(&id);
         self.tasks.insert(
             id.clone(),
-            Box::pin(async move {
-                let r = task.await;
-                let raw = results.load(Ordering::Relaxed);
-                if raw.is_null() {
-                    return;
-                }
+            TaskWrapper::new(
+                id.clone(),
+                async move {
+                    let r = task.await;
+                    let raw = results.load(Ordering::Relaxed);
+                    if raw.is_null() {
+                        return;
+                    }
 
-                unsafe {
-                    let map = &mut *raw;
-                    map.insert(idc, Box::new(r));
-                }
-            }),
+                    let id = idc.clone();
+                    unsafe {
+                        let map = &mut *raw;
+                        // TODO: maybe protect `HashMap::insert` in case user is accessing Scheduler and runs tasks from
+                        // different threads without using Mutex.
+                        map.insert(idc, Box::new(r));
+                    }
+                    // Protect against user cancellation of the task after is already done.
+                    canceled_queue_cl.lock().unwrap().remove(&id);
+                },
+                canceled_queue,
+            ),
         );
         self.priorities
             .entry(Reverse(priority))
@@ -90,6 +165,14 @@ impl<I: Id + Send + Debug + Display + 'static> Scheduler<I> {
                 vd
             });
     }
+
+    pub fn task_manager(&self) -> TaskManager<I> {
+        TaskManager {
+            canceled_queue: Arc::clone(&self.canceled_queue),
+        }
+    }
+
+    pub async fn remove_task(&mut self) {}
 
     pub async fn run_all(&mut self) {
         // Taking priorities in reverse so highest priorities come first.
@@ -190,7 +273,7 @@ impl<I> Drop for Scheduler<I> {
     }
 }
 
-static THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+pub(crate) static THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
 enum PollingStrategy {
     Concurrent,
@@ -209,34 +292,37 @@ type DetachedDependency = Box<dyn FnOnce() -> bool + Send>;
 
 pub struct Task<T> {
     id: &'static str,
-    future: Pin<Box<dyn Future<Output = T> + Send>>,
+    future: Pin<Box<T>>,
     poll_strategy: PollingStrategy,
     dependencies: VecDeque<DependencyFuture>,
     detached_dependencies: Option<Vec<DetachedDependency>>,
-    startline: Option<Instant>,
+    delay: Option<Instant>,
     deadline: Option<Instant>,
     dependency_error: bool,
     stop_on_error: bool,
-    detached_polling_success: Option<Receiver<bool>>,
-    detached_dependencies_success: Option<Receiver<bool>>,
+    detached_polling_receiver: Option<Receiver<bool>>,
+    detached_dependencies_receiver: Option<Receiver<bool>>,
     has_detached_dependencies: bool,
     canceled: bool,
 }
 
-impl<T: Default + Display> Task<T> {
-    pub fn new(id: &'static str, future: impl Future<Output = T> + Send + 'static) -> Self {
+impl<F> Task<F>
+where
+    F: Future
+{
+    pub fn new(id: &'static str, future: F) -> Self {
         Self {
             id,
             future: Box::pin(future),
             poll_strategy: PollingStrategy::Concurrent,
             dependencies: VecDeque::with_capacity(16),
             detached_dependencies: None,
-            startline: None,
+            delay: None,
             deadline: None,
             dependency_error: false,
             stop_on_error: false,
-            detached_polling_success: None,
-            detached_dependencies_success: None,
+            detached_polling_receiver: None,
+            detached_dependencies_receiver: None,
             has_detached_dependencies: false,
             canceled: false,
         }
@@ -301,9 +387,9 @@ impl<T: Default + Display> Task<T> {
         self.canceled = true;
     }
 
-    pub fn startline(&mut self, startline: Duration) -> &mut Self {
+    pub fn delay2(&mut self, due: Duration) -> &mut Self {
         THREAD_POOL.get_or_init(|| ThreadPool::new().unwrap());
-        self.startline = Some(Instant::now() + startline);
+        self.delay = Some(Instant::now() + due);
         self
     }
 
@@ -346,7 +432,7 @@ impl<T: Default + Display> Task<T> {
         true
     }
 
-    fn poll_parallel(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
+    fn poll_parallel(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
         let (sender, receiver) = mpsc::channel(100);
         let p = THREAD_POOL.get().expect("Thread pool not initialized");
 
@@ -362,7 +448,7 @@ impl<T: Default + Display> Task<T> {
         let waker = cx.waker().clone();
         let stop_on_error = self.stop_on_error;
         let (sender_success, receiver_success) = oneshot::channel();
-        self.detached_polling_success = Some(receiver_success);
+        self.detached_polling_receiver = Some(receiver_success);
         let future = async move {
             let mut ret = true;
             let receiver = receiver.take_while(|x| {
@@ -414,7 +500,7 @@ impl<T: Default + Display> Task<T> {
             let waker = cx.waker().clone();
             let stop_on_error = self.stop_on_error;
             let (sender_success, receiver_success) = oneshot::channel();
-            self.detached_dependencies_success = Some(receiver_success);
+            self.detached_dependencies_receiver = Some(receiver_success);
             let future = async move {
                 let mut ret = true;
                 let receiver = receiver.take_while(|x| {
@@ -441,19 +527,19 @@ impl<T: Default + Display> Task<T> {
         false
     }
 
-    fn handle_startline(&mut self, cx: &mut std::task::Context<'_>) -> bool {
-        if self.startline.is_some() {
-            if Instant::now() >= self.startline.unwrap() {
+    fn handle_delay(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        if self.delay.is_some() {
+            if Instant::now() >= self.delay.unwrap() {
                 println!("Startline reached");
-                self.startline = None;
+                self.delay = None;
                 return false;
             } else {
                 let p = THREAD_POOL.get().expect("Thread pool not initialized");
                 let waker = cx.waker().clone();
-                let startline = self.startline.unwrap();
+                let delay = self.delay.unwrap();
 
                 p.spawn_ok(async move {
-                    std::thread::sleep(startline - Instant::now());
+                    std::thread::sleep(delay - Instant::now());
                     waker.wake_by_ref();
                     println!("Hello from thread pool");
                 });
@@ -468,8 +554,8 @@ impl<T: Default + Display> Task<T> {
         detached_receiver: Option<PollingStrategy>,
     ) -> DetachedPolling {
         let dreceiver = match detached_receiver {
-            Some(PollingStrategy::Detached) => &mut self.detached_polling_success,
-            None => &mut self.detached_dependencies_success,
+            Some(PollingStrategy::Detached) => &mut self.detached_polling_receiver,
+            None => &mut self.detached_dependencies_receiver,
             _ => unreachable!(),
         };
 
@@ -494,8 +580,11 @@ impl<T: Default + Display> Task<T> {
     }
 }
 
-impl<T: Display + Default> Future for Task<T> {
-    type Output = T;
+impl<F> Future for Task<F>
+where
+    F:Future<Output: Default + Display>
+{
+    type Output = F::Output;
 
     fn poll(
         mut self: Pin<&mut Self>,
@@ -511,7 +600,7 @@ impl<T: Display + Default> Future for Task<T> {
             return std::task::Poll::Ready(Self::Output::default());
         }
 
-        if self.handle_startline(cx) {
+        if self.handle_delay(cx) {
             return std::task::Poll::Pending;
         }
 
@@ -534,6 +623,7 @@ impl<T: Display + Default> Future for Task<T> {
                 return this.poll_parallel(cx);
             }
             PollingStrategy::Detached => {
+                println!("Detached polling");
                 match this.detached_dependencies_ready(Some(PollingStrategy::Detached)) {
                     DetachedPolling::Ready => {}
                     DetachedPolling::Pending => return std::task::Poll::Pending,

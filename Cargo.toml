@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 futures = { version = "0.3.31", features = ["thread-pool"] }
+pin-project = "1.1.10"
 
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["full"] }
