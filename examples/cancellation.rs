@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use asyncron::{Scheduler, Task};
+use asyncron::{Scheduler, Task, task_ext::TaskExt};
 
 #[derive(Default)]
 struct CustomType {
@@ -54,7 +54,8 @@ async fn main() {
             CustomType {
                 value: "custom_name",
             }
-        }),
+        })
+        .delay(Duration::from_millis(60)),
     );
 
     let tm = scheduler.task_manager();

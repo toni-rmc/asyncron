@@ -2,14 +2,13 @@ use std::{
     any::Any,
     cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    fmt::{Debug, Display},
+    fmt::{self, Debug, Display},
     hash::Hash,
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicPtr, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use futures::{
@@ -21,9 +20,9 @@ use futures::{
     executor::ThreadPool,
 };
 
+pub mod periodic;
 pub mod task_ext;
-
-pub mod delay;
+pub mod time;
 
 pub trait Id: Eq + Hash + Clone {}
 
@@ -37,6 +36,7 @@ impl Id for u64 {}
 
 struct TaskWrapper<I> {
     id: I,
+    priority: u8,
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
@@ -44,11 +44,13 @@ struct TaskWrapper<I> {
 impl<I: Id> TaskWrapper<I> {
     fn new(
         id: I,
+        priority: u8,
         future: impl Future<Output = ()> + Send + 'static,
         canceled_queue: Arc<Mutex<HashSet<I>>>,
     ) -> Self {
         TaskWrapper {
             id,
+            priority,
             future: Box::pin(future),
             canceled_queue,
         }
@@ -87,10 +89,24 @@ impl<I: Eq + Hash> TaskManager<I> {
     }
 }
 
-pub struct TaskHandle<I> {
-    id: I,
-    canceled_queue: Arc<Mutex<HashSet<I>>>,
+#[derive(Debug)]
+pub enum SchedulerResultError {
+    NoResult,     // When the result is not found.
+    TypeMismatch, // When downcasting fails.
 }
+
+impl fmt::Display for SchedulerResultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SchedulerResultError::NoResult => write!(f, "No result found for the given task ID"),
+            SchedulerResultError::TypeMismatch => {
+                write!(f, "Failed to downcast result to the expected type")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchedulerResultError {}
 
 pub struct Scheduler<I> {
     tasks: HashMap<I, TaskWrapper<I>>,
@@ -136,6 +152,7 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
             id.clone(),
             TaskWrapper::new(
                 id.clone(),
+                priority,
                 async move {
                     let r = task.await;
                     let raw = results.load(Ordering::Relaxed);
@@ -144,10 +161,17 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
                     }
 
                     let id = idc.clone();
+                    // SAFETY: `results` is a pointer to a valid `HashMap` and `id` is a valid key.
+                    // We are not removing the key from the map, so it's safe to insert a new
+                    // value. We are also not removing the map itself, so it's safe to access it.
+                    // There is no `store` operation on `results` anywhere, so it's safe to
+                    // access the map with `Ordering::Relaxed`. This Future can only be accessed from the `run` methods
+                    // which only take `&mut self, so there is no way to
+                    // access the map from multiple threads without using `Mutex`. Also, the Rust
+                    // borrowing rules will prevent dropping the `Scheduler` while this Future is
+                    // borrowed.
                     unsafe {
                         let map = &mut *raw;
-                        // TODO: maybe protect `HashMap::insert` in case user is accessing Scheduler and runs tasks from
-                        // different threads without using Mutex.
                         map.insert(idc, Box::new(r));
                     }
                     // Protect against user cancellation of the task after is already done.
@@ -172,7 +196,24 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         }
     }
 
-    pub async fn remove_task(&mut self) {}
+    pub async fn remove_task(&mut self, id: &I) {
+        let task = self.tasks.remove(id);
+
+        let Some(task) = task else {
+            return;
+        };
+        // Clear removed task's `Id` from priorities.
+        if let Some(p) = self.priorities.get_mut(&Reverse(task.priority)) {
+            p.retain(|i| {
+                if i == id {
+                    return false;
+                }
+                true
+            });
+        }
+        // If removed task is in canceled queue, remove it.
+        self.canceled_queue.lock().unwrap().remove(id);
+    }
 
     pub async fn run_all(&mut self) {
         // Taking priorities in reverse so highest priorities come first.
@@ -187,6 +228,15 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
 
     pub async fn run(&mut self, id: &I) {
         if let Some(f) = self.tasks.remove(id) {
+            // Find this `id` in priorities and remove it since that future will run.
+            if let Some(p) = self.priorities.get_mut(&Reverse(f.priority)) {
+                p.retain(|i| {
+                    if i == id {
+                        return false;
+                    }
+                    true
+                });
+            }
             f.await;
         }
     }
@@ -203,40 +253,39 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
 
     pub async fn run_map<T: 'static, R>(&mut self, id: &I, project: impl Fn(&T) -> R) -> Option<R> {
         let r = if let Some(f) = self.tasks.remove(id) {
+            // Find this `id` in priorities and remove it since that future will run.
+            if let Some(p) = self.priorities.get_mut(&Reverse(f.priority)) {
+                p.retain(|i| {
+                    if i == id {
+                        return false;
+                    }
+                    true
+                });
+            }
             f.await;
             self.get_result_ref::<T>(id).map(project)
         } else {
             None
         };
-
-        // Find this `id` in priorities and remove it since that future did run.
-        let mut done = false;
-        for (_, vd) in self.priorities.iter_mut() {
-            vd.retain(|i| {
-                if i == id {
-                    done = true;
-                    return false;
-                }
-                true
-            });
-            if done {
-                break;
-            }
-        }
         r
     }
 
-    pub fn get_result<T: 'static>(&mut self, id: &I) -> Result<Box<T>, Box<dyn Any>> {
+    pub fn get_result<T: 'static>(&mut self, id: &I) -> Result<Box<T>, SchedulerResultError> {
         let raw = self.results.load(Ordering::Relaxed);
         if raw.is_null() {
-            return Err(Box::new(()));
+            return Err(SchedulerResultError::NoResult);
         }
-
+        // SAFETY: `raw` is loaded from `self.results`, which is never replaced once initialized.
+        // Since `self` is `&mut self`, no other threads can access `self.results` simultaneously,
+        // ensuring exclusive access to the underlying `HashMap`. Dereferencing `raw` as a mutable
+        // reference is safe because we have unique access in this function.
         let d = unsafe {
             let map = &mut *raw;
             map.remove(id)
         };
-        d.unwrap_or_else(|| Box::new("No result")).downcast::<T>()
+        d.ok_or(SchedulerResultError::NoResult)?
+            .downcast::<T>()
+            .map_err(|_| SchedulerResultError::TypeMismatch)
     }
 
     pub fn get_result_ref<T: 'static>(&self, id: &I) -> Option<&T> {
@@ -244,6 +293,14 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         if raw.is_null() {
             return None;
         }
+        // SAFETY:
+        // - `raw` was initialized once and is never replaced (`AtomicPtr` is only read, never stored to).
+        // - `raw` always points to a valid `HashMap<I, Box<dyn Any>>`, which is only modified in-place.
+        // - Since we return an immutable reference (`&T`), this method does not mutate the `HashMap`.
+        // - If `id` is missing from the `HashMap`, `map.get(id)` simply returns `None`, which is safe.
+        // - No other thread deallocates `raw`, so it remains valid.
+        // - `raw` is only deallocated when `Scheduler` is dropped and we can't be in this method
+        // after that.
         let d = unsafe {
             let map = &*raw;
             map.get(id)
@@ -251,11 +308,19 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         d.map(|v| v.downcast_ref())?
     }
 
-    pub fn get_result_ref_mut<T: 'static>(&self, id: &I) -> Option<&mut T> {
+    pub fn get_result_ref_mut<T: 'static>(&mut self, id: &I) -> Option<&mut T> {
         let raw = self.results.load(Ordering::Relaxed);
         if raw.is_null() {
             return None;
         }
+        // SAFETY:
+        // - `self.results` is an `AtomicPtr<HashMap<I, Box<dyn Any>>>`, and we assume it was properly initialized.
+        // - This method requires `&mut self`, ensuring no other mutable references to `self.results` exist concurrently.
+        // - The `AtomicPtr` is only read (not modified or replaced) in this method, so the pointer remains valid.
+        // - The pointer is assumed to point to a valid `HashMap<I, Box<dyn Any>>` that outlives this method call.
+        // - `get_mut(id)` returns a mutable reference to the value inside the map, ensuring unique access to the underlying data. If there is no this `id` in the map it returns `None`.
+        // - `downcast_mut()` is safe because we assume only values of the expected type `T` were inserted for the given `id`.
+        // - If `id` does not exist in the map, the method safely returns `None`.
         let d = unsafe {
             let map = &mut *raw;
             map.get_mut(id)
@@ -264,16 +329,30 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
     }
 }
 
+impl<I: Id + Unpin + Send + Debug + Display + 'static> Default for Scheduler<I> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<I> Drop for Scheduler<I> {
     fn drop(&mut self) {
         let raw = self.results.load(Ordering::Relaxed);
         if !raw.is_null() {
+            // SAFETY:
+            // - `self.results` is an `AtomicPtr<HashMap<I, Box<dyn Any>>>`, which we assume was properly initialized.
+            // - This method is only called when `Scheduler` is being dropped, ensuring no other threads will access `self.results` afterward.
+            // - `load(Ordering::Relaxed)` is safe because we are the only thread accessing `self.results` at this point (since `drop` requires `&mut self`).
+            // - If `self.results` is `null`, there is nothing to clean up, so we safely return early.
+            // - `Box::from_raw(raw)` takes ownership of the heap-allocated `HashMap`, ensuring it is properly deallocated.
+            // - Since `self.results` was never replaced with another pointer, we know `raw` points to the originally allocated memory.
+            // - No further accesses to `self.results` occur after `drop(Box::from_raw(raw))`, preventing use-after-free issues.
             unsafe { drop(Box::from_raw(raw)) }; // Proper cleanup
         }
     }
 }
 
-pub(crate) static THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+static THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
 enum PollingStrategy {
     Concurrent,
@@ -290,14 +369,12 @@ enum DetachedPolling {
 type DependencyFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 type DetachedDependency = Box<dyn FnOnce() -> bool + Send>;
 
-pub struct Task<T> {
+pub struct Task<F> {
     id: &'static str,
-    future: Pin<Box<T>>,
+    future: Pin<Box<F>>,
     poll_strategy: PollingStrategy,
     dependencies: VecDeque<DependencyFuture>,
     detached_dependencies: Option<Vec<DetachedDependency>>,
-    delay: Option<Instant>,
-    deadline: Option<Instant>,
     dependency_error: bool,
     stop_on_error: bool,
     detached_polling_receiver: Option<Receiver<bool>>,
@@ -308,7 +385,7 @@ pub struct Task<T> {
 
 impl<F> Task<F>
 where
-    F: Future
+    F: Future,
 {
     pub fn new(id: &'static str, future: F) -> Self {
         Self {
@@ -317,8 +394,6 @@ where
             poll_strategy: PollingStrategy::Concurrent,
             dependencies: VecDeque::with_capacity(16),
             detached_dependencies: None,
-            delay: None,
-            deadline: None,
             dependency_error: false,
             stop_on_error: false,
             detached_polling_receiver: None,
@@ -385,17 +460,6 @@ where
 
     pub fn cancel(&mut self) {
         self.canceled = true;
-    }
-
-    pub fn delay2(&mut self, due: Duration) -> &mut Self {
-        THREAD_POOL.get_or_init(|| ThreadPool::new().unwrap());
-        self.delay = Some(Instant::now() + due);
-        self
-    }
-
-    pub fn deadline(&mut self, deadline: Duration) -> &mut Self {
-        self.deadline = Some(Instant::now() + deadline);
-        self
     }
 
     pub fn sequential(&mut self) -> &mut Self {
@@ -483,7 +547,7 @@ where
         });
     }
 
-    fn pool_detached_dependencies(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+    fn poll_detached_dependencies(&mut self, cx: &mut std::task::Context<'_>) -> bool {
         if let Some(mut detached_dependencies) = self.detached_dependencies.take() {
             let (sender, receiver) = mpsc::channel(100);
             let p = THREAD_POOL.get().expect("Thread pool not initialized");
@@ -517,41 +581,9 @@ where
         false
     }
 
-    fn handle_deadline(&self) -> bool {
-        if let Some(deadline) = self.deadline {
-            if Instant::now() > deadline {
-                println!("Deadline reached");
-                return true;
-            }
-        }
-        false
-    }
-
-    fn handle_delay(&mut self, cx: &mut std::task::Context<'_>) -> bool {
-        if self.delay.is_some() {
-            if Instant::now() >= self.delay.unwrap() {
-                println!("Startline reached");
-                self.delay = None;
-                return false;
-            } else {
-                let p = THREAD_POOL.get().expect("Thread pool not initialized");
-                let waker = cx.waker().clone();
-                let delay = self.delay.unwrap();
-
-                p.spawn_ok(async move {
-                    std::thread::sleep(delay - Instant::now());
-                    waker.wake_by_ref();
-                    println!("Hello from thread pool");
-                });
-                return true;
-            }
-        }
-        false
-    }
-
     fn detached_dependencies_ready(
         &mut self,
-        detached_receiver: Option<PollingStrategy>,
+        detached_receiver: &Option<PollingStrategy>,
     ) -> DetachedPolling {
         let dreceiver = match detached_receiver {
             Some(PollingStrategy::Detached) => &mut self.detached_polling_receiver,
@@ -582,7 +614,7 @@ where
 
 impl<F> Future for Task<F>
 where
-    F:Future<Output: Default + Display>
+    F: Future<Output: Default + Display>,
 {
     type Output = F::Output;
 
@@ -596,16 +628,8 @@ where
             return std::task::Poll::Ready(Self::Output::default());
         }
 
-        if self.handle_deadline() {
-            return std::task::Poll::Ready(Self::Output::default());
-        }
-
-        if self.handle_delay(cx) {
-            return std::task::Poll::Pending;
-        }
-
         if self.has_detached_dependencies {
-            self.pool_detached_dependencies(cx);
+            self.poll_detached_dependencies(cx);
         }
 
         let this = self.get_mut();
@@ -624,7 +648,7 @@ where
             }
             PollingStrategy::Detached => {
                 println!("Detached polling");
-                match this.detached_dependencies_ready(Some(PollingStrategy::Detached)) {
+                match this.detached_dependencies_ready(&Some(PollingStrategy::Detached)) {
                     DetachedPolling::Ready => {}
                     DetachedPolling::Pending => return std::task::Poll::Pending,
                     DetachedPolling::Default => {
@@ -635,7 +659,7 @@ where
         }
 
         if this.dependency_error {
-            // Stop pooling furhter dependencies if `stop_on_error` is set and any of
+            // Stop polling furhter dependencies if `stop_on_error` is set and any of
             // the dependencies failed.
             this.dependencies.clear();
             this.dependencies.shrink_to_fit();
@@ -644,7 +668,7 @@ where
 
         if ready {
             if this.has_detached_dependencies {
-                match this.detached_dependencies_ready(None) {
+                match this.detached_dependencies_ready(&None) {
                     DetachedPolling::Ready => {}
                     DetachedPolling::Pending => return std::task::Poll::Pending,
                     DetachedPolling::Default => {
@@ -653,14 +677,7 @@ where
                 }
             }
             println!("Polling future");
-            let r = this.future.as_mut().poll(cx);
-            if let std::task::Poll::Ready(r) = r {
-                println!("Future completed {}", r);
-                std::task::Poll::Ready(r)
-            } else {
-                println!("Future not ready");
-                std::task::Poll::Pending
-            }
+            this.future.as_mut().poll(cx)
         } else {
             std::task::Poll::Pending
         }
@@ -669,7 +686,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicU8};
+    use std::{
+        sync::{Arc, atomic::AtomicU8},
+        time::Duration,
+    };
 
     use super::*;
 

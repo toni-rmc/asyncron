@@ -1,11 +1,13 @@
 use core::fmt;
-use std::{fmt::{Display, Formatter}, time::Duration};
+use std::{
+    fmt::{Display, Formatter},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use asyncron::Task;
-use asyncron::task_ext::TaskExt;
+use asyncron::{Task, task_ext::TaskExt};
 
-
-async fn first(name: &str) -> u32 {
+async fn first(name: String) -> u32 {
     // nested().await;
     for i in 0..10 {
         println!("VALUE: Hello from first {} {}", i, name);
@@ -61,7 +63,7 @@ async fn some_type() -> SomeType {
 
 #[tokio::main]
 async fn main() {
-    let mut my_future = Task::new("First", first("First"));
+    let mut my_future = Task::new("First", first("First".to_string()));
     let my_future2 = Task::new("Dep", async {
         for i in 0..16 {
             println!("VALUE: Hello from my_future2 ------- {}", i);
@@ -77,19 +79,24 @@ async fn main() {
     // let mut my_future5 = Task::new("Future 5", first("Future 5"));
     // my_future5.startline(Duration::from_secs(1));
 
-    let mut my_future = my_future.delay(Duration::from_millis(1000));
+    let mut dd = my_future;
+    let mut dd = dd.delay(Duration::from_millis(1000));
     // my_future.depends_on(my());
-    my_future.depends_on(my_future2);
+    dd.depends_on(my_future2);
     // my_future.depends_on_future(some_type(), |r| {
     //     println!("Return type of some_type(): {}", r);
     //     true
     // });
-    let my_future = my_future.detached();
-    // my_future.await;
+    let mut dd = dd.timeout(Duration::from_secs(1));
+    dd.detached();
+    // let my_future_cl = Arc::new(Mutex::new(my_future));
 
+    let a = std::pin::pin!(async { 1 });
+    let a = a.delay(Duration::from_secs(1));
+    a.await;
     // my_future.startline(Duration::from_secs(1));
 
-    let mut my_future7 = Task::new("Future 7", first("Future 7"));
+    let mut my_future7 = Task::new("Future 7", first("Future 7".to_string()));
     // my_future7.depends_on(my());
     // my_future7.depends_on(my_future);
     my_future7.add_detached_dependency_future(
@@ -120,8 +127,22 @@ async fn main() {
 
     tokio::spawn(async move {
         // my_future7.detached();
-        let r = my_future7.delay(Duration::from_secs(5)).await;
-        println!("Result: {}", r);
+        dd.add_detached_dependency(|| {
+            for i in 0..17 {
+                println!(
+                    "VALUE: Hello from detached dependency 3 {}",
+                    i.to_string() + " ZZ"
+                );
+                // tokio::time::sleep(Duration::from_millis(1)).await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            0
+        });
+        let ff = dd.timeout(Duration::from_secs(1));
+        let dd = ff.inner();
+        dd.await;
+        //    .timeout(Duration::from_millis(50));
+        // println!("Result: {}", r);
     })
     .await
     .expect("Error spawning future");

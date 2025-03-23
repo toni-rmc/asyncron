@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::delay::Delay;
+use crate::time::{Delay, Timeout};
 
 /// Extend `Future` with time-based operations.
 pub trait TaskExt: Future {
@@ -10,6 +10,13 @@ pub trait TaskExt: Future {
     {
         Delay::new(self, due)
     }
+
+    fn timeout(self, time_limit: Duration) -> Timeout<Self>
+    where
+        Self: Sized,
+    {
+        Timeout::new(self, time_limit)
+    }
 }
 
-impl<T> TaskExt for T where T: Future  {}
+impl<T> TaskExt for T where T: Future {}

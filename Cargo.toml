@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 futures = { version = "0.3.31", features = ["thread-pool"] }
-pin-project = "1.1.10"
+pin-project-lite = "0.2.16"
 
 [dev-dependencies]
+async-std = { version = "1.13.1", features = ["attributes"] }
 tokio = { version = "1.43.0", features = ["full"] }
