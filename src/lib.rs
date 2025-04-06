@@ -6,38 +6,40 @@ use std::{
     hash::Hash,
     pin::Pin,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicPtr, Ordering},
     },
 };
 
-use futures::{
-    FutureExt, StreamExt,
-    channel::{
-        mpsc,
-        oneshot::{self, Receiver},
-    },
-    executor::ThreadPool,
-};
-
 pub mod periodic;
+pub mod task;
 pub mod task_ext;
 pub mod time;
+
+pub use task::Task;
 
 pub trait Id: Eq + Hash + Clone {}
 
 impl Id for &str {}
+impl Id for String {}
 impl Id for i8 {}
 impl Id for u8 {}
+impl Id for i16 {}
+impl Id for u16 {}
 impl Id for i32 {}
 impl Id for u32 {}
 impl Id for i64 {}
 impl Id for u64 {}
+impl Id for i128 {}
+impl Id for u128 {}
+impl Id for isize {}
+impl Id for usize {}
+impl Id for char {}
 
 struct TaskWrapper<I> {
     id: I,
     priority: u8,
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    future: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
     canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
 
@@ -45,7 +47,7 @@ impl<I: Id> TaskWrapper<I> {
     fn new(
         id: I,
         priority: u8,
-        future: impl Future<Output = ()> + Send + 'static,
+        future: impl Future<Output = ()> + Send + Sync + 'static,
         canceled_queue: Arc<Mutex<HashSet<I>>>,
     ) -> Self {
         TaskWrapper {
@@ -66,33 +68,56 @@ impl<I: Unpin + Eq + Hash> Future for TaskWrapper<I> {
         // Check again if user canceled `Task` in the meantime while it's running.
         let mut queue = self.canceled_queue.lock().unwrap();
         if queue.contains(&self.id) {
+            // User canceled `Task` stop execution by returning early.
             queue.remove(&self.id);
             return std::task::Poll::Ready(());
         }
         drop(queue);
-        // let this = self.get_mut();
         self.future.as_mut().poll(cx)
     }
 }
 
-pub struct TaskManager<I> {
+/// Provides control over the lifecycle of scheduled futures within a [`Scheduler`].
+///
+/// A `SchedulerHandle` allows canceling pending or running futures by their ID without
+/// requiring mutable access to the [`Scheduler`] itself. It is typically obtained
+/// by calling [`Scheduler::handle`].
+#[derive(Clone)]
+pub struct SchedulerHandle<I> {
     canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
 
-impl<I: Eq + Hash> TaskManager<I> {
+impl<I: Eq + Hash> SchedulerHandle<I> {
+    /// Cancels the future associated with the given ID, if it is still pending or running.
+    ///
+    /// The result of a completed future remains accessible and is not affected by cancellation.
     pub fn cancel(&self, id: I) {
         self.canceled_queue.lock().unwrap().insert(id);
     }
 
+    /// Attempts to restore a previously canceled future, allowing it to be executed again.
+    ///
+    /// Restoration will succeed if the future was canceled and then restored before
+    /// it started running. If cancellation and restoration are invoked concurrently
+    /// from different tasks while the future is starting or running, the outcome is
+    /// not guaranteed and depends on timing.
     pub fn restore(&self, id: &I) {
         self.canceled_queue.lock().unwrap().remove(id);
     }
 }
 
-#[derive(Debug)]
+/// Represents errors that can occur when retrieving a stored result from the scheduler.
+///
+/// This error type is returned by the [`Scheduler::get_result`] method when result
+/// retrieval fails, either because the result is missing or the stored value cannot
+/// be downcast to the expected type.
+#[derive(Clone, Copy, Debug)]
 pub enum SchedulerResultError {
-    NoResult,     // When the result is not found.
-    TypeMismatch, // When downcasting fails.
+    /// No result was found for the requested future.
+    NoResult,
+
+    /// The stored result could not be downcast to the expected type.
+    TypeMismatch,
 }
 
 impl fmt::Display for SchedulerResultError {
@@ -108,14 +133,24 @@ impl fmt::Display for SchedulerResultError {
 
 impl std::error::Error for SchedulerResultError {}
 
-pub struct Scheduler<I> {
+/// Manages the execution and scheduling of tasks and futures.
+///
+/// Futures can be added with a priority, executed, canceled, and their results
+/// stored upon completion. Supports both `Task` instances and ordinary futures,
+/// enabling prioritized and cancellable execution.
+pub struct Scheduler<I: Sync> {
     tasks: HashMap<I, TaskWrapper<I>>,
     priorities: BTreeMap<Reverse<u8>, VecDeque<I>>,
     results: Arc<AtomicPtr<HashMap<I, Box<dyn Any>>>>,
     canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
 
-impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
+impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
+    /// Creates a new `Scheduler` instance.
+    ///
+    /// The scheduler manages and executes both `Task` instances and ordinary futures,
+    /// allowing them to be run, prioritized, and canceled as needed.
+    /// Completed futures have their results stored for later retrieval.
     pub fn new() -> Self {
         // Allocate a new boxed HashMap and create a raw pointer to it.
         let boxed_map = Box::new(HashMap::<I, Box<dyn Any>>::with_capacity(8));
@@ -128,19 +163,30 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         }
     }
 
-    pub fn add_task<T: Display + 'static>(
+    /// Adds a new task with an ID to the scheduler.
+    ///
+    /// The task will be tracked and executed based on its priority within the scheduler.
+    /// Once completed, its result will be stored for later retrieval.
+    /// Execution occurs when you call `run`, `run_all`, or `run_priorities` on the scheduler.
+    /// TODO: Mention default priority.
+    pub fn schedule<T: 'static>(
         &mut self,
         id: I,
-        task: impl Future<Output = T> + Send + 'static,
+        task: impl Future<Output = T> + Send + Sync + 'static,
     ) {
-        self.add_priority_task(id, 0, task);
+        self.schedule_priority(id, 0, task);
     }
 
-    pub fn add_priority_task<T: Display + 'static>(
+    /// Adds a new task to the scheduler with an ID and specified priority.
+    ///
+    /// Higher-priority tasks are executed before lower-priority ones.
+    /// Once completed, the task's result will be stored for later retrieval.
+    /// Execution occurs when you call `run`, `run_all`, or `run_priorities` on the scheduler.
+    pub fn schedule_priority<T: 'static>(
         &mut self,
         id: I,
         priority: u8,
-        task: impl Future<Output = T> + Send + 'static,
+        task: impl Future<Output = T> + Send + Sync + 'static,
     ) {
         let idc = id.clone();
         let results = Arc::clone(&self.results);
@@ -190,13 +236,21 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
             });
     }
 
-    pub fn task_manager(&self) -> TaskManager<I> {
-        TaskManager {
+    /// Returns a [`SchedulerHandle`] that can be used to manage scheduled futures.
+    ///
+    /// The returned [`SchedulerHandle`] provides functionality to cancel running or
+    /// pending futures by their ID without consuming the scheduler.
+    pub fn handle(&self) -> SchedulerHandle<I> {
+        SchedulerHandle {
             canceled_queue: Arc::clone(&self.canceled_queue),
         }
     }
 
-    pub async fn remove_task(&mut self, id: &I) {
+    /// Removes a scheduled task from the scheduler.
+    ///
+    /// If the task is still pending, it will be removed.
+    /// Completed task results remain accessible.
+    pub fn remove(&mut self, id: &I) {
         let task = self.tasks.remove(id);
 
         let Some(task) = task else {
@@ -215,6 +269,11 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         self.canceled_queue.lock().unwrap().remove(id);
     }
 
+    /// Executes all scheduled futures that have not yet completed or been canceled.
+    ///
+    /// Futures are executed sequentially, with higher-priority ones running first.
+    /// When priorities are equal, insertion order determines the execution order.
+    /// Results are stored and can be retrieved later.
     pub async fn run_all(&mut self) {
         // Taking priorities in reverse so highest priorities come first.
         for (_, vd) in self.priorities.iter_mut() {
@@ -226,6 +285,9 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         }
     }
 
+    /// Executes the future associated with the given identifier and stores it's result.
+    ///
+    /// If the future has already completed or been canceled, this method does nothing.
     pub async fn run(&mut self, id: &I) {
         if let Some(f) = self.tasks.remove(id) {
             // Find this `id` in priorities and remove it since that future will run.
@@ -241,6 +303,12 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         }
     }
 
+    /// Executes all scheduled futures with the specified priority that have not
+    /// yet completed or been canceled.
+    ///
+    /// Futures are executed sequentially in the order they were added.
+    /// If no futures with the given priority exist, this method does nothing.
+    /// Results are stored and can be retrieved later.
     pub async fn run_priorities(&mut self, priority: u8) {
         if let Some(vd) = self.priorities.get_mut(&Reverse(priority)) {
             while let Some(id) = vd.pop_front() {
@@ -251,6 +319,12 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         }
     }
 
+    /// Runs the future with the given ID and applies a projection function to its result.
+    ///
+    /// If the future completes successfully and its result is of type `T`, the
+    /// `project` function is applied and its output returned. Returns `None` if the
+    /// future is missing, fails to produce a result, or the result is not of type `T`.
+    /// The original result remains cached and is unaffected by the projection.
     pub async fn run_map<T: 'static, R>(&mut self, id: &I, project: impl Fn(&T) -> R) -> Option<R> {
         let r = if let Some(f) = self.tasks.remove(id) {
             // Find this `id` in priorities and remove it since that future will run.
@@ -270,6 +344,29 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         r
     }
 
+    /// Attempts to retrieve the result of a completed future by its identifier.
+    ///
+    /// Returns a boxed value of type `T` if the result exists and matches the expected
+    /// type. If the future has not completed, has been removed, or the stored result
+    /// type does not match `T`, an appropriate [`SchedulerResultError`] is returned.
+    ///
+    /// # Example
+    /// ```
+    /// # use asyncron::{Scheduler, SchedulerResultError};
+    /// #
+    /// # async {
+    /// let mut scheduler = Scheduler::new();
+    ///
+    /// scheduler.schedule("task1", async { 42u32 });
+    /// scheduler.run_all().await;
+    ///
+    /// match scheduler.get_result::<u32>(&"task1") {
+    ///     Ok(result) => println!("Result: {}", *result),
+    ///     Err(SchedulerResultError::NoResult) => eprintln!("No result found."),
+    ///     Err(SchedulerResultError::TypeMismatch) => eprintln!("Result type mismatch."),
+    /// }
+    /// # };
+    /// ```
     pub fn get_result<T: 'static>(&mut self, id: &I) -> Result<Box<T>, SchedulerResultError> {
         let raw = self.results.load(Ordering::Relaxed);
         if raw.is_null() {
@@ -288,6 +385,26 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
             .map_err(|_| SchedulerResultError::TypeMismatch)
     }
 
+    /// Returns a reference to the result of a completed future, if available and of
+    /// the expected type.
+    ///
+    /// This method allows read-only access to the result without taking ownership.
+    /// Returns `None` if the result is missing or the stored type does not match `T`.
+    ///
+    /// # Example
+    /// ```
+    /// # use asyncron::Scheduler;
+    /// #
+    /// # async {
+    /// let mut scheduler = Scheduler::new();
+    /// scheduler.schedule("task1", async { 42u32 });
+    /// scheduler.run(&"task1").await;
+    ///
+    /// if let Some(value) = scheduler.get_result_ref::<u32>(&"task1") {
+    ///     println!("Value: {}", value);
+    /// }
+    /// # };
+    /// ```
     pub fn get_result_ref<T: 'static>(&self, id: &I) -> Option<&T> {
         let raw = self.results.load(Ordering::Relaxed);
         if raw.is_null() {
@@ -308,6 +425,26 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
         d.map(|v| v.downcast_ref())?
     }
 
+    /// Returns a mutable reference to the result of a completed future, if available
+    /// and of the expected type.
+    ///
+    /// This allows in-place modification of the stored result. Returns `None` if no
+    /// result is associated with the given `id`, or if the stored type does not match `T`.
+    ///
+    /// # Example
+    /// ```
+    /// # use asyncron::Scheduler;
+    /// #
+    /// # async {
+    /// let mut scheduler = Scheduler::new();
+    /// scheduler.schedule("task1", async { 42u32 });
+    /// scheduler.run(&"task1").await;
+    ///
+    /// if let Some(value) = scheduler.get_result_ref_mut::<u32>(&"task1") {
+    ///     *value += 1; // Modify the stored result
+    /// }
+    /// # };
+    /// ```
     pub fn get_result_ref_mut<T: 'static>(&mut self, id: &I) -> Option<&mut T> {
         let raw = self.results.load(Ordering::Relaxed);
         if raw.is_null() {
@@ -329,13 +466,13 @@ impl<I: Id + Unpin + Send + Debug + Display + 'static> Scheduler<I> {
     }
 }
 
-impl<I: Id + Unpin + Send + Debug + Display + 'static> Default for Scheduler<I> {
+impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Default for Scheduler<I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I> Drop for Scheduler<I> {
+impl<I: Sync> Drop for Scheduler<I> {
     fn drop(&mut self) {
         let raw = self.results.load(Ordering::Relaxed);
         if !raw.is_null() {
@@ -348,338 +485,6 @@ impl<I> Drop for Scheduler<I> {
             // - Since `self.results` was never replaced with another pointer, we know `raw` points to the originally allocated memory.
             // - No further accesses to `self.results` occur after `drop(Box::from_raw(raw))`, preventing use-after-free issues.
             unsafe { drop(Box::from_raw(raw)) }; // Proper cleanup
-        }
-    }
-}
-
-static THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
-
-enum PollingStrategy {
-    Concurrent,
-    StepByStep,
-    Detached,
-}
-
-enum DetachedPolling {
-    Ready,
-    Pending,
-    Default,
-}
-
-type DependencyFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
-type DetachedDependency = Box<dyn FnOnce() -> bool + Send>;
-
-pub struct Task<F> {
-    id: &'static str,
-    future: Pin<Box<F>>,
-    poll_strategy: PollingStrategy,
-    dependencies: VecDeque<DependencyFuture>,
-    detached_dependencies: Option<Vec<DetachedDependency>>,
-    dependency_error: bool,
-    stop_on_error: bool,
-    detached_polling_receiver: Option<Receiver<bool>>,
-    detached_dependencies_receiver: Option<Receiver<bool>>,
-    has_detached_dependencies: bool,
-    canceled: bool,
-}
-
-impl<F> Task<F>
-where
-    F: Future,
-{
-    pub fn new(id: &'static str, future: F) -> Self {
-        Self {
-            id,
-            future: Box::pin(future),
-            poll_strategy: PollingStrategy::Concurrent,
-            dependencies: VecDeque::with_capacity(16),
-            detached_dependencies: None,
-            dependency_error: false,
-            stop_on_error: false,
-            detached_polling_receiver: None,
-            detached_dependencies_receiver: None,
-            has_detached_dependencies: false,
-            canceled: false,
-        }
-    }
-
-    pub fn depends_on<R>(&mut self, future: impl Future<Output = R> + Send + 'static) -> &mut Self
-    where
-        R: Display,
-    {
-        self.dependencies.push_back(Box::pin(future.map(|_| {
-            println!("MAP: Dependency mapped");
-            true
-        })));
-        self
-    }
-
-    pub fn depends_on_future<R>(
-        &mut self,
-        future: impl Future<Output = R> + Send + 'static,
-        catch_rt: impl FnOnce(R) -> bool + Send + 'static,
-    ) -> &mut Self
-    where
-        R: Display,
-    {
-        self.stop_on_error = true;
-        self.dependencies.push_back(Box::pin(future.map(|r| {
-            let r = catch_rt(r);
-            println!("MAP: Dependency future mapped");
-            r
-        })));
-        self
-    }
-
-    pub fn add_detached_dependency<R>(&mut self, dep: impl FnOnce() -> R + Send + 'static) {
-        self.has_detached_dependencies = true;
-        let wrap = || {
-            let _ = dep();
-            true
-        };
-
-        self.detached_dependencies
-            .get_or_insert_with(|| Vec::with_capacity(16))
-            .push(Box::new(wrap));
-    }
-
-    pub fn add_detached_dependency_future<R: 'static>(
-        &mut self,
-        dep: impl FnOnce() -> R + Send + 'static,
-        catch_rt: impl FnOnce(R) -> bool + Send + 'static,
-    ) {
-        self.has_detached_dependencies = true;
-        self.stop_on_error = true;
-        self.detached_dependencies
-            .get_or_insert_with(|| Vec::with_capacity(16))
-            .push(Box::new(move || {
-                let r = dep();
-                catch_rt(r)
-            }));
-    }
-
-    pub fn cancel(&mut self) {
-        self.canceled = true;
-    }
-
-    pub fn sequential(&mut self) -> &mut Self {
-        self.poll_strategy = PollingStrategy::StepByStep;
-        self
-    }
-
-    pub fn detached(&mut self) -> &mut Self {
-        THREAD_POOL.get_or_init(|| ThreadPool::new().unwrap());
-        self.poll_strategy = PollingStrategy::Detached;
-        self
-    }
-
-    pub fn concurrent(&mut self) -> &mut Self {
-        self.poll_strategy = PollingStrategy::Concurrent;
-        self
-    }
-
-    fn poll_sequential(&mut self, cx: &mut std::task::Context<'_>) -> bool {
-        while let Some(mut dep) = self.dependencies.pop_front() {
-            if let std::task::Poll::Ready(success) = Pin::new(&mut dep).poll(cx) {
-                println!(" ++++++++++++++++++++++++++ Dependency completed {success}");
-                if self.stop_on_error && !success {
-                    println!("Dependency stopped");
-                    self.dependency_error = true;
-                    return false;
-                }
-            } else {
-                println!("Dependency not ready");
-                self.dependencies.push_front(dep);
-                return false;
-            }
-        }
-        true
-    }
-
-    fn poll_parallel(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
-        let (sender, receiver) = mpsc::channel(100);
-        let p = THREAD_POOL.get().expect("Thread pool not initialized");
-
-        while let Some(dep) = self.dependencies.pop_front() {
-            let mut sender = sender.clone();
-            p.spawn_ok(async move {
-                println!("Polling dependency in thread pool");
-                let r = dep.await;
-                println!("Dependency completed {}", r);
-                let _ = sender.try_send(r);
-            });
-        }
-        let waker = cx.waker().clone();
-        let stop_on_error = self.stop_on_error;
-        let (sender_success, receiver_success) = oneshot::channel();
-        self.detached_polling_receiver = Some(receiver_success);
-        let future = async move {
-            let mut ret = true;
-            let receiver = receiver.take_while(|x| {
-                ret = !stop_on_error || *x;
-                futures::future::ready(ret)
-            });
-            receiver.collect::<Vec<_>>().await;
-            let _ = sender_success.send(ret);
-            waker.wake_by_ref();
-        };
-        p.spawn_ok(future);
-        std::task::Poll::Pending
-    }
-
-    fn poll_concurrent(&mut self, cx: &mut std::task::Context<'_>, ready: &mut bool) {
-        self.dependencies.retain_mut(|dep| {
-            if self.dependency_error {
-                return false;
-            }
-            if let std::task::Poll::Ready(success) = Pin::new(dep).poll(cx) {
-                println!(" ++++++++++++++++++++++++++ Dependency completed {success}");
-                if self.stop_on_error && !success {
-                    println!("Dependency stopped");
-                    self.dependency_error = true;
-                }
-                false
-            } else {
-                println!("Dependency not ready");
-                *ready = false;
-                true
-            }
-        });
-    }
-
-    fn poll_detached_dependencies(&mut self, cx: &mut std::task::Context<'_>) -> bool {
-        if let Some(mut detached_dependencies) = self.detached_dependencies.take() {
-            let (sender, receiver) = mpsc::channel(100);
-            let p = THREAD_POOL.get().expect("Thread pool not initialized");
-
-            while let Some(dep) = detached_dependencies.pop() {
-                let mut sender = sender.clone();
-                p.spawn_ok(async move {
-                    println!("Polling detached dependency in thread pool");
-                    let r = dep();
-                    println!("Detached dependency completed {}", r);
-                    let _ = sender.try_send(r);
-                });
-            }
-            let waker = cx.waker().clone();
-            let stop_on_error = self.stop_on_error;
-            let (sender_success, receiver_success) = oneshot::channel();
-            self.detached_dependencies_receiver = Some(receiver_success);
-            let future = async move {
-                let mut ret = true;
-                let receiver = receiver.take_while(|x| {
-                    ret = !stop_on_error || *x;
-                    futures::future::ready(ret)
-                });
-                receiver.collect::<Vec<_>>().await;
-                let _ = sender_success.send(ret);
-                waker.wake_by_ref();
-            };
-            p.spawn_ok(future);
-            return true;
-        }
-        false
-    }
-
-    fn detached_dependencies_ready(
-        &mut self,
-        detached_receiver: &Option<PollingStrategy>,
-    ) -> DetachedPolling {
-        let dreceiver = match detached_receiver {
-            Some(PollingStrategy::Detached) => &mut self.detached_polling_receiver,
-            None => &mut self.detached_dependencies_receiver,
-            _ => unreachable!(),
-        };
-
-        if let Some(receiver) = dreceiver.as_mut() {
-            if let Ok(Some(r)) = receiver.try_recv() {
-                if self.stop_on_error && !r {
-                    self.dependencies.clear();
-                    self.dependencies.shrink_to_fit();
-                    dreceiver.take();
-                    println!(
-                        "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ Detached dependency failed"
-                    );
-                    return DetachedPolling::Default;
-                }
-                dreceiver.take();
-                return DetachedPolling::Ready;
-            } else {
-                return DetachedPolling::Pending;
-            }
-        }
-        DetachedPolling::Ready
-    }
-}
-
-impl<F> Future for Task<F>
-where
-    F: Future<Output: Default + Display>,
-{
-    type Output = F::Output;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        println!(" ########################## Polling Task {}", self.id);
-
-        if self.canceled {
-            return std::task::Poll::Ready(Self::Output::default());
-        }
-
-        if self.has_detached_dependencies {
-            self.poll_detached_dependencies(cx);
-        }
-
-        let this = self.get_mut();
-        let mut ready = true;
-
-        match this.poll_strategy {
-            PollingStrategy::Concurrent => {
-                this.poll_concurrent(cx, &mut ready);
-            }
-            PollingStrategy::StepByStep => {
-                // Sequentially poll dependencies.
-                ready = this.poll_sequential(cx);
-            }
-            PollingStrategy::Detached if !this.dependencies.is_empty() => {
-                return this.poll_parallel(cx);
-            }
-            PollingStrategy::Detached => {
-                println!("Detached polling");
-                match this.detached_dependencies_ready(&Some(PollingStrategy::Detached)) {
-                    DetachedPolling::Ready => {}
-                    DetachedPolling::Pending => return std::task::Poll::Pending,
-                    DetachedPolling::Default => {
-                        return std::task::Poll::Ready(Self::Output::default());
-                    }
-                }
-            }
-        }
-
-        if this.dependency_error {
-            // Stop polling furhter dependencies if `stop_on_error` is set and any of
-            // the dependencies failed.
-            this.dependencies.clear();
-            this.dependencies.shrink_to_fit();
-            return std::task::Poll::Ready(Self::Output::default());
-        }
-
-        if ready {
-            if this.has_detached_dependencies {
-                match this.detached_dependencies_ready(&None) {
-                    DetachedPolling::Ready => {}
-                    DetachedPolling::Pending => return std::task::Poll::Pending,
-                    DetachedPolling::Default => {
-                        return std::task::Poll::Ready(Self::Output::default());
-                    }
-                }
-            }
-            println!("Polling future");
-            this.future.as_mut().poll(cx)
-        } else {
-            std::task::Poll::Pending
         }
     }
 }

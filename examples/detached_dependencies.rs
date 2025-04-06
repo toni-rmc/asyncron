@@ -7,14 +7,14 @@ use std::{
 
 use asyncron::{Task, task_ext::TaskExt};
 
-async fn first(name: String) -> u32 {
+async fn first(name: String) {
     // nested().await;
     for i in 0..10 {
-        println!("VALUE: Hello from first {} {}", i, name);
+        // println!("VALUE: Hello from first {} {}", i, name);
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+    println!("After loop in first");
     // tokio::time::sleep(Duration::from_millis(500)).await;
-    0
 }
 
 async fn nested() -> i32 {
@@ -88,23 +88,26 @@ async fn main() {
     //     true
     // });
     let mut dd = dd.timeout(Duration::from_secs(1));
-    dd.detached();
+    // dd.detached();
     // let my_future_cl = Arc::new(Mutex::new(my_future));
 
-    let a = std::pin::pin!(async { 1 });
+    let a = std::pin::pin!(async {
+        println!("OOOOOOOOOOOOOOOOOOOOOOOO");
+        1
+    });
     let a = a.delay(Duration::from_secs(1));
-    a.await;
+    // let _r = a.await;
     // my_future.startline(Duration::from_secs(1));
 
     let mut my_future7 = Task::new("Future 7", first("Future 7".to_string()));
     // my_future7.depends_on(my());
     // my_future7.depends_on(my_future);
-    my_future7.add_detached_dependency_future(
+    my_future7.depends_on_detached_if(
         || {
             for i in 0..17 {
                 println!("VALUE: Hello from detached dependency {}", i);
                 // tokio::time::sleep(Duration::from_millis(1)).await;
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1000));
             }
         },
         |r| {
@@ -113,21 +116,21 @@ async fn main() {
         },
     );
 
-    my_future7.add_detached_dependency(|| {
+    my_future7.depends_on_detached(|| {
         for i in 0..17 {
             println!(
                 "VALUE: Hello from detached dependency 2 {}",
                 i.to_string() + " YY"
             );
             // tokio::time::sleep(Duration::from_millis(1)).await;
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1000));
         }
         0
     });
 
     tokio::spawn(async move {
         // my_future7.detached();
-        dd.add_detached_dependency(|| {
+        dd.depends_on_detached(|| {
             for i in 0..17 {
                 println!(
                     "VALUE: Hello from detached dependency 3 {}",
@@ -140,9 +143,10 @@ async fn main() {
         });
         let ff = dd.timeout(Duration::from_secs(1));
         let dd = ff.inner();
-        dd.await;
+        // dd.await;
         //    .timeout(Duration::from_millis(50));
         // println!("Result: {}", r);
+        my_future7.await;
     })
     .await
     .expect("Error spawning future");

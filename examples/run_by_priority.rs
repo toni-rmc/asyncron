@@ -24,7 +24,7 @@ async fn main() {
     let mut sch = Scheduler::new();
 
     // Default priority `0`.
-    sch.add_task(
+    sch.schedule(
         "id1",
         Task::new("task1", async {
             println!("Running `Task 1`");
@@ -34,13 +34,13 @@ async fn main() {
 
     // Default priority `0`.
     // No need to use `Task` struct if you don't need functionality provided by it.
-    sch.add_task("id2", async {
+    sch.schedule("id2", async {
         println!("Running `Task 2`");
         1
     });
 
     // Scheduling with priority `1`, should be run first even though it's added last.
-    sch.add_priority_task(
+    sch.schedule_priority(
         "id3",
         1,
         Task::new("task3", async {

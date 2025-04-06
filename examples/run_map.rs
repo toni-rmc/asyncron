@@ -20,12 +20,12 @@ impl Display for CustomType {
 #[tokio::main]
 async fn main() {
     let mut sch = Scheduler::new();
-    sch.add_task(1, Task::new("task1", async { 0.7 }));
+    sch.schedule(1, Task::new("task1", async { 0.7 }));
 
     // No need to use `Task` struct if you don't need functionality provided by it.
-    sch.add_task(2, async { 1 });
+    sch.schedule(2, async { 1 });
 
-    sch.add_task(
+    sch.schedule(
         3,
         Task::new("task3", async {
             tokio::time::sleep(Duration::from_millis(1)).await;

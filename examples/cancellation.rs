@@ -24,7 +24,7 @@ async fn main() {
     let mut scheduler = Scheduler::new();
 
     // Default priority `0`.
-    scheduler.add_task(
+    scheduler.schedule(
         "id1",
         Task::new("task1", async {
             println!("Running `Task 1`");
@@ -34,7 +34,7 @@ async fn main() {
 
     // Default priority `0`.
     // No need to use `Task` struct if you don't need functionality provided by it.
-    scheduler.add_task("id2", async {
+    scheduler.schedule("id2", async {
         for i in 0..350 {
             println!("Running `Task 2` {i}");
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -43,7 +43,7 @@ async fn main() {
     });
 
     // Scheduling with priority `1`, should be run first even though it's added last.
-    scheduler.add_priority_task(
+    scheduler.schedule_priority(
         "id3",
         1,
         Task::new("task3", async {
@@ -58,7 +58,7 @@ async fn main() {
         .delay(Duration::from_millis(60)),
     );
 
-    let tm = scheduler.task_manager();
+    let tm = scheduler.handle();
     tokio::task::spawn(async move {
         // Allow tasks to run for a while before cancelling them.
         tokio::time::sleep(Duration::from_millis(100)).await;
