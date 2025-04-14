@@ -7,6 +7,7 @@ use tokio::join;
 async fn print_1_to_10() {
     for i in 1..=10 {
         println!("{}", i);
+        let _ = tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -15,6 +16,7 @@ async fn print_10_to_100() {
     while i < 100 {
         println!("hello {i}");
         i = i + 10;
+        let _ = tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -36,7 +38,7 @@ async fn main() {
     let (periodic2, _) = PeriodicTask::new(15, print_10_to_100, Duration::from_secs(3));
     let periodic2 = periodic2.timeout(Duration::from_secs(30));
 
-    periodic.on_completion(|&r| {
+    periodic.on_result(|&r| {
         println!("Result returned {r}");
     });
 

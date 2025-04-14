@@ -171,7 +171,7 @@ where
     ///
     /// [`depends_on`]: struct.Task.html#method.depends_on
     /// [`depends_on_if`]: struct.Task.html#method.depends_on_if
-    /// [`Scheduler`]: ../struct.Scheduler.html
+    /// [`Scheduler`]: ../scheduler/struct.Scheduler.html
     pub fn new(id: &'static str, future: F) -> Self {
         Self {
             id,
@@ -232,8 +232,8 @@ where
     /// ```
     /// # use asyncron::Task;
     /// #
-    /// # let mut task = Task::new("n", async {});
     /// # async {
+    /// # let mut task = Task::new("n", async {});
     /// # let dependency_1 = async {};
     /// # let dependency_2 = async { 1 };
     /// # let dependency_3 = async {};
@@ -279,8 +279,8 @@ where
     /// ```
     /// # use asyncron::Task;
     /// #
-    /// # let mut task = Task::new("w", async {});
     /// # async {
+    /// # let mut task = Task::new("w", async {});
     /// task.depends_on_detached(|| {
     ///     // Perform some blocking computation.
     ///     std::thread::sleep(std::time::Duration::from_secs(1));
