@@ -1,7 +1,5 @@
-use std::time::Duration;
-
 use asyncron::{periodic::PeriodicTask, task_ext::TaskExt};
-
+use std::time::Duration;
 use tokio::join;
 
 async fn print_1_to_10() {

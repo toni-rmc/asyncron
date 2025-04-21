@@ -1,10 +1,9 @@
+use asyncron::{Priority, Scheduler, Task};
 use core::fmt;
 use std::{
     fmt::{Display, Formatter},
     time::Duration,
 };
-
-use asyncron::{Scheduler, Task};
 
 #[derive(Default)]
 struct CustomType {
@@ -23,7 +22,7 @@ async fn main() {
     // are run in order of scheduling.
     let mut sch = Scheduler::new();
 
-    // Default priority `0`.
+    // Default priority `NORMAL`.
     sch.schedule(
         "id1",
         Task::new("task1", async {
@@ -32,17 +31,17 @@ async fn main() {
         }),
     );
 
-    // Default priority `0`.
+    // Default priority `NORMAL`.
     // No need to use `Task` struct if you don't need functionality provided by it.
     sch.schedule("id2", async {
         println!("Running `Task 2`");
         1
     });
 
-    // Scheduling with priority `1`, should be run first even though it's added last.
+    // Scheduling with priority `HIGH`, should be run first even though it's added last.
     sch.schedule_priority(
         "id3",
-        1,
+        Priority::HIGH,
         Task::new("task3", async {
             println!("Running `Task 3`");
             tokio::time::sleep(Duration::from_millis(1)).await;

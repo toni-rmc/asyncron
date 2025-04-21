@@ -1,10 +1,9 @@
+use asyncron::{Scheduler, Task};
 use core::fmt;
 use std::{
     fmt::{Display, Formatter},
     time::Duration,
 };
-
-use asyncron::{Scheduler, Task};
 
 #[derive(Default)]
 struct CustomType {

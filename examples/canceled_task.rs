@@ -1,6 +1,5 @@
-use std::time::Duration;
-
 use asyncron::Task;
+use std::time::Duration;
 
 async fn y() {
     for i in 0..10 {

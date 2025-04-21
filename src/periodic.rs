@@ -9,7 +9,7 @@
 //! the periodic execution. Two types of cancellation are supported:
 //! - **Hard cancellation**, which attempts to stop execution immediately.
 //! - **Soft cancellation**, which waits for the currently running future to
-//! complete before stopping.
+//!   complete before stopping.
 //!
 //! Periodic tasks must be manually spawned onto an executor to begin running.
 
@@ -227,9 +227,9 @@ where
 /// task’s lifecycle. It supports both soft and hard cancellation:
 ///
 /// - **Soft cancellation**: Waits for the currently running future to complete
-/// before stopping further execution.
+///   before stopping further execution.
 /// - **Hard cancellation**: Attempts to abruptly stop execution, even if a future
-/// is currently running.
+///   is currently running.
 ///
 /// Use soft cancellation when graceful shutdown is desired, and hard cancellation
 /// when an immediate stop is necessary.
@@ -333,6 +333,7 @@ impl Cancellation {
     }
 
     /// Returns `true` if cancellation has been requested.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }

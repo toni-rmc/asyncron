@@ -81,7 +81,7 @@ impl<F> Delay<F> {
             }
             let p = THREAD_POOL.get().expect("Thread pool not initialized");
             let waker = cx.waker().clone();
-            let delay = (*proj.delay).clone();
+            let delay = *proj.delay;
 
             println!("Scheduling delay");
             p.spawn_ok(async move {

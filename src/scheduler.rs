@@ -23,6 +23,8 @@ use std::{
     },
 };
 
+use crate::Priority;
+
 /// A trait for types that can be used as identifiers for scheduled futures.
 ///
 /// This trait is used by the [`Scheduler`] to uniquely identify and manage scheduled
@@ -51,7 +53,7 @@ impl Id for usize {}
 
 struct TaskWrapper<I> {
     id: I,
-    priority: u8,
+    priority: Priority,
     future: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
     canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
@@ -59,7 +61,7 @@ struct TaskWrapper<I> {
 impl<I: Id> TaskWrapper<I> {
     fn new(
         id: I,
-        priority: u8,
+        priority: Priority,
         future: impl Future<Output = ()> + Send + Sync + 'static,
         canceled_queue: Arc<Mutex<HashSet<I>>>,
     ) -> Self {
@@ -153,7 +155,7 @@ impl std::error::Error for SchedulerResultError {}
 /// enabling prioritized and cancellable execution.
 pub struct Scheduler<I: Sync> {
     tasks: HashMap<I, TaskWrapper<I>>,
-    priorities: BTreeMap<Reverse<u8>, VecDeque<I>>,
+    priorities: BTreeMap<Reverse<Priority>, VecDeque<I>>,
     results: Arc<AtomicPtr<HashMap<I, Box<dyn Any>>>>,
     canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
@@ -164,6 +166,7 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     /// The scheduler manages and executes both `Task` instances and ordinary futures,
     /// allowing them to be run, prioritized, and canceled as needed.
     /// Completed futures have their results stored for later retrieval.
+    #[must_use]
     pub fn new() -> Self {
         // Allocate a new boxed HashMap and create a raw pointer to it.
         let boxed_map = Box::new(HashMap::<I, Box<dyn Any>>::with_capacity(8));
@@ -181,13 +184,15 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     /// The task will be tracked and executed based on its priority within the scheduler.
     /// Once completed, its result will be stored for later retrieval.
     /// Execution occurs when you call `run`, `run_all`, or `run_priorities` on the scheduler.
-    /// TODO: Mention default priority.
+    ///
+    /// Tasks added with this method are scheduled with the default priority of
+    /// [`Priority::NORMAL`].
     pub fn schedule<T: 'static>(
         &mut self,
         id: I,
         task: impl Future<Output = T> + Send + Sync + 'static,
     ) {
-        self.schedule_priority(id, 0, task);
+        self.schedule_priority(id, Priority::NORMAL, task);
     }
 
     /// Adds a new task to the scheduler with an ID and specified priority.
@@ -198,7 +203,7 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     pub fn schedule_priority<T: 'static>(
         &mut self,
         id: I,
-        priority: u8,
+        priority: Priority,
         task: impl Future<Output = T> + Send + Sync + 'static,
     ) {
         let idc = id.clone();
@@ -253,6 +258,7 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     ///
     /// The returned [`SchedulerHandle`] provides functionality to cancel running or
     /// pending futures by their ID without consuming the scheduler.
+    #[must_use]
     pub fn handle(&self) -> SchedulerHandle<I> {
         SchedulerHandle {
             canceled_queue: Arc::clone(&self.canceled_queue),
@@ -289,7 +295,7 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     /// Results are stored and can be retrieved later.
     pub async fn run_all(&mut self) {
         // Taking priorities in reverse so highest priorities come first.
-        for (_, vd) in self.priorities.iter_mut() {
+        for vd in &mut self.priorities.values_mut() {
             while let Some(id) = vd.pop_front() {
                 if let Some(f) = self.tasks.remove(&id) {
                     f.await;
@@ -322,7 +328,7 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     /// Futures are executed sequentially in the order they were added.
     /// If no futures with the given priority exist, this method does nothing.
     /// Results are stored and can be retrieved later.
-    pub async fn run_priorities(&mut self, priority: u8) {
+    pub async fn run_priorities(&mut self, priority: Priority) {
         if let Some(vd) = self.priorities.get_mut(&Reverse(priority)) {
             while let Some(id) = vd.pop_front() {
                 if let Some(f) = self.tasks.remove(&id) {
@@ -453,12 +459,12 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     /// scheduler.schedule("task1", async { 42u32 });
     /// scheduler.run(&"task1").await;
     ///
-    /// if let Some(value) = scheduler.get_result_ref_mut::<u32>(&"task1") {
+    /// if let Some(value) = scheduler.get_result_mut::<u32>(&"task1") {
     ///     *value += 1; // Modify the stored result
     /// }
     /// # };
     /// ```
-    pub fn get_result_ref_mut<T: 'static>(&mut self, id: &I) -> Option<&mut T> {
+    pub fn get_result_mut<T: 'static>(&mut self, id: &I) -> Option<&mut T> {
         let raw = self.results.load(Ordering::Relaxed);
         if raw.is_null() {
             return None;

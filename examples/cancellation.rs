@@ -1,10 +1,9 @@
+use asyncron::{Scheduler, Task, task_ext::TaskExt};
 use core::fmt;
 use std::{
     fmt::{Display, Formatter},
     time::Duration,
 };
-
-use asyncron::{Scheduler, Task, task_ext::TaskExt};
 
 #[derive(Default)]
 struct CustomType {
@@ -45,7 +44,7 @@ async fn main() {
     // Scheduling with priority `1`, should be run first even though it's added last.
     scheduler.schedule_priority(
         "id3",
-        1,
+        1.into(),
         Task::new("task3", async {
             for i in 0..350 {
                 println!("Running `Task 3` {i}");

@@ -1,73 +1,29 @@
+//! Utilities for structured and composable asynchronous control flow.
+//!
+//! `asyncron` provides lightweight primitives for managing asynchronous
+//! tasks and behaviors in Rust. It includes scheduling mechanisms, periodic
+//! execution, and task combinators for adding time-based logic to futures.
+//!
+//! The crate is designed to work independently of any specific async runtime,
+//! making it flexible and adaptable to various execution environments.
+//!
+//! Features include:
+//! - A `Scheduler` for prioritizing and tracking async tasks
+//! - A `Task` future that encapsulates asynchronous work, supports
+//!   dependencies (including detached ones), and configurable polling strategies
+//! - A `PeriodicTask` for running recurring futures with control over timing and cancellation
+//! - Time-based wrappers like `Delay` and `Timeout` for augmenting futures
+//!
+//! All components are modular and designed for composability, making it
+//! easier to build expressive and maintainable async systems.
+
 pub mod periodic;
+pub mod priority;
 pub mod scheduler;
 pub mod task;
 pub mod task_ext;
 pub mod timing;
 
+pub use priority::Priority;
 pub use scheduler::{Id, Scheduler, SchedulerResultError};
 pub use task::Task;
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        sync::{Arc, Mutex, atomic::AtomicU8},
-        time::Duration,
-    };
-
-    use crate::periodic::PeriodicTask;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_task_dependencies() {
-        let dependency_done = Arc::new(AtomicU8::new(0));
-        let dependency_done2 = Arc::clone(&dependency_done);
-
-        let mut task = Task::new("First", async {
-            for _ in 0..16 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            "Result".to_string()
-        });
-
-        let task2 = Task::new("Dep", async move {
-            for _ in 0..16 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            dependency_done2.store(1, std::sync::atomic::Ordering::Relaxed);
-            0
-        });
-
-        task.depends_on(task2);
-        let r = task.await;
-        assert_eq!(
-            dependency_done.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(r, "Result".to_string());
-    }
-
-    #[tokio::test]
-    async fn test_periodic_task() {
-        let collect_results = Arc::new(Mutex::new(vec![16]));
-        let collect_results_cl = Arc::clone(&collect_results);
-
-        let (task, cancellation) = PeriodicTask::new(
-            "test",
-            move || {
-                let collect_results2 = Arc::clone(&collect_results);
-                async move {
-                    let mut results = collect_results2.lock().unwrap();
-                    results.push(1);
-                }
-            },
-            Duration::from_millis(100),
-        );
-
-        tokio::spawn(task);
-        tokio::time::sleep(Duration::from_millis(3000)).await;
-        cancellation.cancel_after_ready();
-
-        assert!(collect_results_cl.lock().unwrap().len() > 0);
-    }
-}

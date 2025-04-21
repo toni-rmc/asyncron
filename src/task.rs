@@ -293,7 +293,7 @@ where
         &mut self,
         task_fn: impl FnOnce() -> R + Send + Sync + 'static,
     ) -> &mut Self {
-        self.set_thread_pool();
+        Self::set_thread_pool();
         let wrap = || {
             let _ = task_fn();
             true
@@ -346,7 +346,7 @@ where
         task_fn: impl FnOnce() -> R + Send + Sync + 'static,
         should_continue: impl FnOnce(R) -> bool + Send + Sync + 'static,
     ) -> &mut Self {
-        self.set_thread_pool();
+        Self::set_thread_pool();
         self.state.stop_on_error = true;
         self.detached_dependencies
             .get_or_insert_with(DetachedDependencies::new)
@@ -360,6 +360,7 @@ where
     /// Returns a handle for canceling the task and its dependencies.  
     /// The returned [`TaskHandle`] can be used to prevent the task from starting or to stop it if already running.  
     /// Any pending dependencies will not start, while running dependencies will be stopped.  
+    #[must_use]
     pub fn get_handle(&self) -> TaskHandle {
         TaskHandle {
             canceled: self.state.canceled.clone(),
@@ -381,7 +382,7 @@ where
     /// **Note:** When using this strategy, dependencies must not use executor-specific
     /// code (e.g., `tokio::time::sleep()`), as this will cause a panic.
     pub fn detached(&mut self) -> &mut Self {
-        THREAD_POOL.get_or_init(|| ThreadPool::new().unwrap());
+        Self::set_thread_pool();
         self.poll_strategy = PollingStrategy::Detached;
         self
     }
@@ -469,6 +470,7 @@ where
             let (sender, receiver) = mpsc::channel(100);
             let p = THREAD_POOL.get().expect("Thread pool not initialized");
 
+            println!("~~~~~~~~~~~~~~~ {}", detached_dependencies.cb_list.len());
             while let Some(dep) = detached_dependencies.cb_list.pop() {
                 let mut sender = sender.clone();
                 p.spawn_ok(async move {
@@ -501,7 +503,7 @@ where
         false
     }
 
-    fn set_thread_pool(&self) {
+    fn set_thread_pool() {
         THREAD_POOL.get_or_init(|| {
             ThreadPoolBuilder::new()
                 .pool_size(40)
@@ -512,11 +514,11 @@ where
 
     fn detached_dependencies_ready(
         &mut self,
-        detached_receiver: &Option<PollingStrategy>,
+        detached_receiver: Option<&PollingStrategy>,
     ) -> DetachedPolling {
         // ###########
         let dreceiver = match detached_receiver {
-            Some(PollingStrategy::Detached) => &mut self.dependencies.receiver,
+            Some(&PollingStrategy::Detached) => &mut self.dependencies.receiver,
             None => &mut self.detached_dependencies.as_mut().unwrap().receiver,
             _ => unreachable!(),
         };
@@ -537,9 +539,8 @@ where
                 }
                 dreceiver.take();
                 return DetachedPolling::Ready;
-            } else {
-                return DetachedPolling::Pending;
             }
+            return DetachedPolling::Pending;
         }
         DetachedPolling::Ready
     }
@@ -583,7 +584,7 @@ where
             }
             PollingStrategy::Detached => {
                 println!("Detached polling");
-                match this.detached_dependencies_ready(&Some(PollingStrategy::Detached)) {
+                match this.detached_dependencies_ready(Some(&PollingStrategy::Detached)) {
                     DetachedPolling::Ready => {}
                     DetachedPolling::Pending => return std::task::Poll::Pending,
                     DetachedPolling::Default => {
@@ -604,7 +605,7 @@ where
 
         if ready {
             if this.detached_dependencies.is_some() {
-                match this.detached_dependencies_ready(&None) {
+                match this.detached_dependencies_ready(None) {
                     DetachedPolling::Ready => {
                         this.detached_dependencies.take();
                     }
