@@ -6,7 +6,7 @@ async fn main() {
     let (mut task, cancel) = PeriodicTask::new(
         1,
         || async {
-            // Simulate some async work
+            // Simulate some async work.
             println!("Task is running");
             42
         },
@@ -18,8 +18,12 @@ async fn main() {
     });
 
     tokio::spawn(task);
+    tokio::spawn(async move {
+        // Let it run a few times before cancelling.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        cancel.cancel();
+    });
 
-    // Let it run a few times before cancelling
-    tokio::time::sleep(Duration::from_secs(7)).await;
-    cancel.cancel();
+    // Give it some time before the program exits.
+    tokio::time::sleep(Duration::from_secs(9)).await;
 }

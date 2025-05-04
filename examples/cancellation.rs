@@ -25,7 +25,7 @@ async fn main() {
     // Default priority `0`.
     scheduler.schedule(
         "id1",
-        Task::new("task1", async {
+        Task::new(async {
             println!("Running `Task 1`");
             0.7
         }),
@@ -45,7 +45,7 @@ async fn main() {
     scheduler.schedule_priority(
         "id3",
         1.into(),
-        Task::new("task3", async {
+        Task::new(async {
             for i in 0..350 {
                 println!("Running `Task 3` {i}");
                 tokio::time::sleep(Duration::from_millis(1)).await;

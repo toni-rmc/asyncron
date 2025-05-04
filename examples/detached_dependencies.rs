@@ -11,8 +11,8 @@ async fn first() {
 
 #[tokio::main]
 async fn main() {
-    let mut future = Task::new("First", first());
-    let future2 = Task::new("Dep", async {
+    let mut future = Task::new(first());
+    let future2 = Task::new(async {
         for i in 0..17 {
             println!("future2: {i}");
             tokio::time::sleep(Duration::from_millis(700)).await;
@@ -29,8 +29,10 @@ async fn main() {
                 println!("Detached dependency 1: {i}");
                 std::thread::sleep(Duration::from_millis(1000));
             }
+            // Return odd number and main task won't run, return even and it will.
+            1
         },
-        |_| true,
+        |i| i % 2 == 0,
     );
 
     future.depends_on_detached(|| {

@@ -1,15 +1,23 @@
 [package]
 name = "asyncron"
 version = "0.1.0"
+authors = ["Toni Romic <toni.rmc@gmail.com>"]
 edition = "2024"
+description = "Executor agnostic task manager and async scheduler for Rust."
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/toni-rmc/asyncron"
+categories = ["asynchronous", "concurrency"]
+keywords = ["async", "task-manager", "scheduler", "executor-agnostic", "async-dependencies"]
 
 [dependencies]
 futures = { version = "0.3.31", features = ["thread-pool"] }
 pin-project-lite = "0.2.16"
 
 [dev-dependencies]
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
+smol = "2.0.2"
 smol-macros = "0.1.1"
 macro_rules_attribute = "0.2.0"
-smol = "2.0.2"
 futures-lite = "2.6.0"

@@ -1,8 +1,9 @@
 /// Fine-grained priority level used by the scheduler.
 ///
 /// Higher numeric values (0-255) represent higher priorities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Priority(pub u8);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[must_use]
+pub struct Priority(u8);
 
 impl Priority {
     /// Critical priority for tasks that must execute immediately (255)
@@ -26,17 +27,18 @@ impl Priority {
     }
 
     /// Get the raw priority value
+    #[must_use]
     pub const fn value(&self) -> u8 {
         self.0
     }
 
     /// Create a slightly higher priority (+10, capped at 255)
-    pub fn higher(&self) -> Self {
+    pub const fn higher(&self) -> Self {
         Self(self.0.saturating_add(10))
     }
 
     /// Create a slightly lower priority (-10, minimum 0)
-    pub fn lower(&self) -> Self {
+    pub const fn lower(&self) -> Self {
         Self(self.0.saturating_sub(10))
     }
 }

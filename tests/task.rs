@@ -10,14 +10,14 @@ async fn task_dependencies() {
     let dependency_done = Arc::new(AtomicU8::new(0));
     let dependency_done2 = Arc::clone(&dependency_done);
 
-    let mut task = Task::new("Main", async {
+    let mut task = Task::new(async {
         for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         "Result".to_string()
     });
 
-    let task2 = Task::new("Dep", async move {
+    let task2 = Task::new(async move {
         for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -41,14 +41,14 @@ async fn task_optional_dependencies() {
     let dependency_cl = Arc::clone(&dependency_done);
     let dependency_cl2 = Arc::clone(&dependency_done);
 
-    let mut task = Task::new("Main", async {
+    let mut task = Task::new(async {
         for _ in 0..16 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         "Result".to_string()
     });
 
-    let d1 = Task::new("Dep1", async move {
+    let d1 = Task::new(async move {
         for _ in 0..16 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -56,7 +56,7 @@ async fn task_optional_dependencies() {
         1
     });
 
-    let d2 = Task::new("Dep2", async move {
+    let d2 = Task::new(async move {
         for _ in 0..16 {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -87,7 +87,7 @@ async fn task_detached_dependencies() {
     let dependency_done = Arc::new(AtomicU8::new(0));
     let dependency_cl = Arc::clone(&dependency_done);
 
-    let mut task = Task::new("Main", async {
+    let mut task = Task::new(async {
         for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -122,7 +122,7 @@ async fn task_optional_detached_dependencies() {
     let dependency_cl = Arc::clone(&dependency_done);
     let dependency_cl2 = Arc::clone(&dependency_done);
 
-    let mut task = Task::new("Main", async {
+    let mut task = Task::new(async {
         for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -170,7 +170,7 @@ async fn task_sequential_polling() {
     let dep_results_cl1 = Arc::clone(&dep_results);
     let dep_results_cl2 = Arc::clone(&dep_results);
 
-    let mut task = Task::new("Main", async {
+    let mut task = Task::new(async {
         for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -217,7 +217,7 @@ async fn task_detached_polling() {
     let dep_results_cl1 = Arc::clone(&dep_results);
     let dep_results_cl2 = Arc::clone(&dep_results);
 
-    let mut task = Task::new("Main", async {
+    let mut task = Task::new(async {
         for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -269,7 +269,7 @@ async fn delayed_task() {
     let dep_results_cl1 = Arc::clone(&dep_results);
     let dep_results_cl2 = Arc::clone(&dep_results);
 
-    let mut task = Task::new("Main", async {
+    let mut task = Task::new(async {
         for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }

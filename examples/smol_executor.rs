@@ -10,7 +10,7 @@ async fn first() {
 
 #[apply(main!)]
 async fn main(ex: &Executor<'_>) {
-    let mut task = Task::new("Main", first());
+    let mut task = Task::new(first());
 
     task.depends_on(async {
         println!("Dependency 1");
@@ -24,10 +24,7 @@ async fn main(ex: &Executor<'_>) {
         println!("Dependency 2 end");
     });
 
-    ex.spawn(async move {
-        task.await;
-    })
-    .detach();
+    ex.spawn(task).detach();
 
     println!("After task spawn");
     Timer::after(Duration::from_secs(7)).await;

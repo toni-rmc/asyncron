@@ -10,11 +10,12 @@
 //! The scheduler executes futures sequentially, in order of descending priority,
 //! using the order in which they were scheduled to resolve ties.
 
+use crate::Priority;
 use std::{
     any::Any,
     cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    fmt::{self, Debug, Display},
+    fmt,
     hash::Hash,
     pin::Pin,
     sync::{
@@ -22,8 +23,6 @@ use std::{
         atomic::{AtomicPtr, Ordering},
     },
 };
-
-use crate::Priority;
 
 /// A trait for types that can be used as identifiers for scheduled futures.
 ///
@@ -126,7 +125,7 @@ impl<I: Eq + Hash> SchedulerHandle<I> {
 /// This error type is returned by the [`Scheduler::get_result`] method when result
 /// retrieval fails, either because the result is missing or the stored value cannot
 /// be downcast to the expected type.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchedulerResultError {
     /// No result was found for the requested future.
     NoResult,
@@ -153,14 +152,14 @@ impl std::error::Error for SchedulerResultError {}
 /// Futures can be added with a priority, executed, canceled, and their results
 /// stored upon completion. Supports both `Task` instances and ordinary futures,
 /// enabling prioritized and cancellable execution.
-pub struct Scheduler<I: Sync> {
+pub struct Scheduler<I> {
     tasks: HashMap<I, TaskWrapper<I>>,
     priorities: BTreeMap<Reverse<Priority>, VecDeque<I>>,
     results: Arc<AtomicPtr<HashMap<I, Box<dyn Any>>>>,
     canceled_queue: Arc<Mutex<HashSet<I>>>,
 }
 
-impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
+impl<I: Id + Unpin + Send + Sync + 'static> Scheduler<I> {
     /// Creates a new `Scheduler` instance.
     ///
     /// The scheduler manages and executes both `Task` instances and ordinary futures,
@@ -366,8 +365,14 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     /// Attempts to retrieve the result of a completed future by its identifier.
     ///
     /// Returns a boxed value of type `T` if the result exists and matches the expected
-    /// type. If the future has not completed, has been removed, or the stored result
-    /// type does not match `T`, an appropriate [`SchedulerResultError`] is returned.
+    /// type. Returns a [`SchedulerResultError`] if the future has not completed, has
+    /// been removed, no result exists for the given ID, or if the stored result type
+    /// does not match `T`.
+    ///
+    /// # Errors
+    ///
+    /// - `SchedulerResultError::NoResult`: No result was found for the given ID.
+    /// - `SchedulerResultError::TypeMismatch`: The stored result type does not match `T`.
     ///
     /// # Example
     /// ```
@@ -401,7 +406,16 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
         };
         d.ok_or(SchedulerResultError::NoResult)?
             .downcast::<T>()
-            .map_err(|_| SchedulerResultError::TypeMismatch)
+            .map_err(|e| {
+                unsafe {
+                    // SAFETY: The `HashMap` is valid for this objects duration and
+                    // we already checked that `raw` is not null so we can reuse it
+                    // to insert the value back into the map if user typed wrong type.
+                    let map = &mut *raw;
+                    map.insert(id.clone(), e);
+                }
+                SchedulerResultError::TypeMismatch
+            })
     }
 
     /// Returns a reference to the result of a completed future, if available and of
@@ -485,13 +499,13 @@ impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Scheduler<I> {
     }
 }
 
-impl<I: Id + Unpin + Send + Sync + Debug + Display + 'static> Default for Scheduler<I> {
+impl<I: Id + Unpin + Send + Sync + 'static> Default for Scheduler<I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I: Sync> Drop for Scheduler<I> {
+impl<I> Drop for Scheduler<I> {
     fn drop(&mut self) {
         let raw = self.results.load(Ordering::Relaxed);
         if !raw.is_null() {

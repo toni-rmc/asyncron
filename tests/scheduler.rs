@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use asyncron::{Priority, Scheduler};
+use asyncron::{Priority, Scheduler, SchedulerResultError};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scheduler_schedule() {
@@ -124,4 +124,33 @@ async fn scheduler_run_map() {
 
     let r = scheduler.run_map(&"test_task_id", |_: &i32| "Result").await;
     assert_eq!(r, Some("Result"), "Task should have run");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_get_result() {
+    let mut scheduler = Scheduler::new();
+
+    scheduler.schedule("test_task_id", async move { 1 });
+    scheduler.run(&"test_task_id").await;
+
+    // Lets first test erorr types.
+    //
+    // Wrong task id:
+    let e = scheduler.get_result::<i32>(&"wrong_task_id");
+    assert_eq!(
+        e.err(),
+        Some(SchedulerResultError::NoResult),
+        "Should return no result error"
+    );
+    // Wrong type:
+    let e = scheduler.get_result::<u8>(&"test_task_id");
+    assert_eq!(
+        e.err(),
+        Some(SchedulerResultError::TypeMismatch),
+        "Should return wrong type error"
+    );
+
+    // Get proper result.
+    let r = scheduler.get_result(&"test_task_id");
+    assert_eq!(r.ok(), Some(Box::new(1)), "Task should have run");
 }

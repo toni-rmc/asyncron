@@ -149,7 +149,6 @@ impl TaskHandle {
 /// Error handling behavior can be defined to control whether dependencies should
 /// stop execution based on the returned value.
 pub struct Task<F> {
-    id: &'static str,
     future: Pin<Box<F>>,
     poll_strategy: PollingStrategy,
     dependencies: Dependencies,
@@ -165,16 +164,19 @@ where
     ///
     /// The provided future represents the main task to be executed. Dependencies can be added
     /// using [`depends_on`] or [`depends_on_if`], and they will be polled according to the specified
-    /// polling strategy.  
+    /// polling strategy.
+    ///
+    /// If the future `F` returns a value, that value must implement
+    /// the [`Default`] trait, as it will be used as the default value for the task if it is
+    /// canceled.
     ///
     /// The task itself does not start running immediately; it must be `.awaited` or run with [`Scheduler`] to execute.
     ///
     /// [`depends_on`]: struct.Task.html#method.depends_on
     /// [`depends_on_if`]: struct.Task.html#method.depends_on_if
     /// [`Scheduler`]: ../scheduler/struct.Scheduler.html
-    pub fn new(id: &'static str, future: F) -> Self {
+    pub fn new(future: F) -> Self {
         Self {
-            id,
             future: Box::pin(future),
             poll_strategy: PollingStrategy::Concurrent,
             dependencies: Dependencies::new(),
@@ -202,10 +204,9 @@ where
         &mut self,
         future: impl Future<Output = R> + Send + Sync + 'static,
     ) -> &mut Self {
-        self.dependencies.list.push_back(Box::pin(future.map(|_| {
-            println!("MAP: Dependency mapped");
-            true
-        })));
+        self.dependencies
+            .list
+            .push_back(Box::pin(future.map(|_| true)));
         self
     }
 
@@ -233,7 +234,7 @@ where
     /// # use asyncron::Task;
     /// #
     /// # async {
-    /// # let mut task = Task::new("n", async {});
+    /// # let mut task = Task::new(async {});
     /// # let dependency_1 = async {};
     /// # let dependency_2 = async { 1 };
     /// # let dependency_3 = async {};
@@ -254,11 +255,9 @@ where
         should_continue: impl FnOnce(R) -> bool + Send + Sync + 'static,
     ) -> &mut Self {
         self.state.stop_on_error = true;
-        self.dependencies.list.push_back(Box::pin(future.map(|r| {
-            let r = should_continue(r);
-            println!("MAP: Dependency future mapped");
-            r
-        })));
+        self.dependencies
+            .list
+            .push_back(Box::pin(future.map(should_continue)));
         self
     }
 
@@ -280,7 +279,7 @@ where
     /// # use asyncron::Task;
     /// #
     /// # async {
-    /// # let mut task = Task::new("w", async {});
+    /// # let mut task = Task::new(async {});
     /// task.depends_on_detached(|| {
     ///     // Perform some blocking computation.
     ///     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -325,7 +324,7 @@ where
     /// # use asyncron::Task;
     /// #
     /// # async {
-    /// # let mut task = Task::new("ww", async {});
+    /// # let mut task = Task::new(async {});
     /// task
     ///     .depends_on_detached_if(
     ///         || {
@@ -399,14 +398,11 @@ where
     fn poll_sequential(&mut self, cx: &mut std::task::Context<'_>) -> bool {
         while let Some(mut dep) = self.dependencies.list.pop_front() {
             if let std::task::Poll::Ready(success) = Pin::new(&mut dep).poll(cx) {
-                println!(" ++++++++++++++++++++++++++ Dependency completed {success}");
                 if self.state.stop_on_error && !success {
-                    println!("Dependency stopped");
                     self.state.dependency_error = true;
                     return false;
                 }
             } else {
-                println!("Dependency not ready");
                 self.dependencies.list.push_front(dep);
                 return false;
             }
@@ -421,9 +417,7 @@ where
         while let Some(dep) = self.dependencies.list.pop_front() {
             let mut sender = sender.clone();
             p.spawn_ok(async move {
-                println!("Polling dependency in thread pool");
                 let r = dep.await;
-                println!("Dependency completed {}", r);
                 let _ = sender.try_send(r);
             });
         }
@@ -451,14 +445,11 @@ where
                 return false;
             }
             if let std::task::Poll::Ready(success) = Pin::new(dep).poll(cx) {
-                println!(" ++++++++++++++++++++++++++ Dependency completed {success}");
                 if self.state.stop_on_error && !success {
-                    println!("Dependency stopped");
                     self.state.dependency_error = true;
                 }
                 false
             } else {
-                println!("Dependency not ready");
                 *ready = false;
                 true
             }
@@ -470,15 +461,10 @@ where
             let (sender, receiver) = mpsc::channel(100);
             let p = THREAD_POOL.get().expect("Thread pool not initialized");
 
-            println!("~~~~~~~~~~~~~~~ {}", detached_dependencies.cb_list.len());
             while let Some(dep) = detached_dependencies.cb_list.pop() {
                 let mut sender = sender.clone();
                 p.spawn_ok(async move {
-                    println!("Polling detached dependency in thread pool");
                     let r = dep();
-                    println!("Detached dependency completed {}", r);
-
-                    // TODO: Check for send result
                     let _ = sender.try_send(r);
                 });
             }
@@ -527,14 +513,9 @@ where
         if let Some(receiver) = dreceiver.as_mut() {
             if let Ok(Some(r)) = receiver.try_recv() {
                 if self.state.stop_on_error && !r {
-                    // --------------
                     self.dependencies.list.clear();
                     self.dependencies.list.shrink_to_fit();
-                    // --------------
                     dreceiver.take();
-                    println!(
-                        "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ Detached dependency failed"
-                    );
                     return DetachedPolling::Default;
                 }
                 dreceiver.take();
@@ -556,8 +537,6 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        println!(" ########################## Polling Task {}", self.id);
-
         if self.state.canceled.load(Ordering::Relaxed) {
             return std::task::Poll::Ready(Self::Output::default());
         }
@@ -583,7 +562,6 @@ where
                 return this.poll_parallel(cx);
             }
             PollingStrategy::Detached => {
-                println!("Detached polling");
                 match this.detached_dependencies_ready(Some(&PollingStrategy::Detached)) {
                     DetachedPolling::Ready => {}
                     DetachedPolling::Pending => return std::task::Poll::Pending,
@@ -599,7 +577,6 @@ where
             // the dependencies failed.
             this.dependencies.list.clear();
             this.dependencies.list.shrink_to_fit();
-            println!("DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD {}", this.id);
             return std::task::Poll::Ready(Self::Output::default());
         }
 
@@ -615,10 +592,8 @@ where
                     }
                 }
             }
-            println!("Polling future");
-            this.future.as_mut().poll(cx)
-        } else {
-            std::task::Poll::Pending
+            return this.future.as_mut().poll(cx);
         }
+        std::task::Poll::Pending
     }
 }

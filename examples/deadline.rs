@@ -20,7 +20,7 @@ async fn first() -> TestResult {
 
 #[tokio::main]
 async fn main() {
-    let mut future = Task::new("Main", first());
+    let mut future = Task::new(first());
     let future2 = async {
         for i in 0..15 {
             println!("Dependency {i}");

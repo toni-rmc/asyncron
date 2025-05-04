@@ -25,7 +25,7 @@ async fn main() {
     // Default priority `NORMAL`.
     sch.schedule(
         "id1",
-        Task::new("task1", async {
+        Task::new(async {
             println!("Running `Task 1`");
             0.7
         }),
@@ -42,7 +42,7 @@ async fn main() {
     sch.schedule_priority(
         "id3",
         Priority::HIGH,
-        Task::new("task3", async {
+        Task::new(async {
             println!("Running `Task 3`");
             tokio::time::sleep(Duration::from_millis(1)).await;
             CustomType {

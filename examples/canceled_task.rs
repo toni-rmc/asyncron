@@ -18,7 +18,7 @@ async fn x() {
 
 #[tokio::main]
 async fn main() {
-    let mut task = Task::new("First", x());
+    let mut task = Task::new(x());
 
     task.depends_on(async {
         for i in 0..25 {

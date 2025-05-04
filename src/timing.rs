@@ -45,7 +45,6 @@ impl<F> Delay<F> {
     /// A more convenient way to construct this is via the [`delay()`](../task_ext/trait.TaskExt.html#method.delay)
     /// operator.
     pub fn new(future: F, delay: Duration) -> Self {
-        println!("------- CREATING DELAY -----------------");
         THREAD_POOL.get_or_init(|| {
             ThreadPoolBuilder::new()
                 .pool_size(100)
@@ -70,9 +69,7 @@ impl<F> Delay<F> {
 
     fn handle_delay(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> bool {
         let proj = self.project();
-        println!("~~~~~~~~~~ {:?} >= {:?}", Instant::now(), proj.delay);
         if Instant::now() >= *proj.delay {
-            println!("############################### Delay reached");
             *proj.delayed = false;
             false
         } else {
@@ -83,12 +80,9 @@ impl<F> Delay<F> {
             let waker = cx.waker().clone();
             let delay = *proj.delay;
 
-            println!("Scheduling delay");
             p.spawn_ok(async move {
-                println!("Sleeping for {:?}", delay - Instant::now());
                 std::thread::sleep(delay - Instant::now());
                 waker.wake_by_ref();
-                println!("Hello from thread pool");
             });
             *proj.delayed = true;
             true
@@ -120,12 +114,9 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        println!("Polling in delay");
         if self.as_mut().handle_delay(cx) {
-            println!("Delaying");
             return std::task::Poll::Pending;
         }
-        // Pin::new(&mut self.get_mut().future).poll(cx)
         let this = self.as_mut().project();
         this.future.poll(cx)
     }
@@ -171,7 +162,11 @@ impl<F> Timeout<F> {
         self.future
     }
 
-    // TODO: Implement a way to reset the timeout.
+    /// Sets a new time limit for the `Timeout`.
+    pub fn set_time_limit(&mut self, time_limit: Duration) {
+        let time_limit = Instant::now() + time_limit;
+        self.time_limit = time_limit;
+    }
 }
 
 impl<F> Deref for Timeout<F> {
@@ -199,23 +194,18 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        println!("Polling in timeout");
         if Instant::now() >= self.time_limit {
-            println!("Timeout reached");
             return std::task::Poll::Ready(Self::Output::default());
         }
-        // Pin::new(&mut self.get_mut().future).poll(cx)
         let this = self.project();
         this.future.poll(cx)
     }
 }
 
 pub(crate) mod schedule {
-    use std::time::{Duration, Instant};
-
-    use futures::executor::ThreadPoolBuilder;
-
     use crate::timing::THREAD_POOL;
+    use futures::executor::ThreadPoolBuilder;
+    use std::time::{Duration, Instant};
 
     #[derive(Clone)]
     pub(crate) struct Periodic {
@@ -224,7 +214,6 @@ pub(crate) mod schedule {
 
     impl Periodic {
         pub(crate) fn new(due: Duration) -> Self {
-            println!("------- CREATING DELAY -----------------");
             THREAD_POOL.get_or_init(|| {
                 ThreadPoolBuilder::new()
                     .pool_size(100)
@@ -241,17 +230,13 @@ pub(crate) mod schedule {
         }
 
         fn handle_delay(&mut self, cx: &mut std::task::Context<'_>) {
-            println!("~~~~~~~~~~ {:?} >= {:?}", Instant::now(), self.due);
             let p = THREAD_POOL.get().expect("Thread pool not initialized");
             let waker = cx.waker().clone();
             let delay = self.due;
 
-            // println!("Scheduling delay");
             p.spawn_ok(async move {
-                // println!("Sleeping for {:?}", delay - Instant::now());
                 std::thread::sleep(delay - Instant::now());
                 waker.wake_by_ref();
-                println!("Hello from thread pool");
             });
         }
     }
@@ -263,9 +248,7 @@ pub(crate) mod schedule {
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Self::Output> {
-            // println!("Polling in delay");
             self.handle_delay(cx);
-            // println!("Delaying");
             std::task::Poll::Ready(())
         }
     }
